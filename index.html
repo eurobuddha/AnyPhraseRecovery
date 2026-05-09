@@ -10,7 +10,11 @@
 </head>
 <body>
   <header>
-    <h1>AnyPhraseRecovery</h1>
+    <div class="header-row">
+      <h1>AnyPhraseRecovery</h1>
+      <button id="global-reset-btn" class="btn header-reset" hidden
+              title="Wipes saved recovery state and returns to the welcome screen">Start over</button>
+    </div>
     <p class="sub">Sweep funds out of a compromised webWallet seed without giving up control of this Minima node.</p>
   </header>
 
@@ -313,7 +317,7 @@
         <div class="card">
           <div class="step-indicator">Step 5 of 5 — Restore your wallet</div>
           <h2>Put your wallet back</h2>
-          <p class="hint">This runs <code>megammrsync action:resync</code> with the snapshot you took in step 1 as input. After it finishes, this node's seed and wallet will be exactly as they were before recovery began.</p>
+          <p class="hint">This runs <code>restore</code> with the snapshot you took in step 1 as input. Local file, no host needed. After it finishes, this node's seed and wallet will be exactly as they were before recovery began.</p>
 
           <p id="restore-wait-status" class="status warn"></p>
 
@@ -372,7 +376,7 @@
             <strong>Verification failed.</strong>
             Don't panic — your funds are safe on chain. Manual recovery options:
             <ol class="next-steps">
-              <li>Run from the terminal: <code id="verify-failure-cmd">megammrsync action:resync host:&lt;host&gt; file:&lt;backup&gt; password:&lt;password&gt;</code> (the values are in this dapp's saved state — see "Saved state" below). Then restart your node.</li>
+              <li>Run from the terminal: <code id="verify-failure-cmd">restore file:&lt;backup&gt; password:&lt;password&gt;</code> (the values are in this dapp's saved state — see "Saved state" below). Then restart your node.</li>
               <li>If that fails, reinstall Minima fresh and run <code>vault action:restorekeys phrase:"&lt;your original seed&gt;"</code> with the seed you wrote on paper in step 1. Then restart.</li>
               <li>Either way, your recovered funds are at the destination Mx you swept to and will be spendable as soon as the wallet is restored.</li>
             </ol>

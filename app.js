@@ -1,4 +1,4 @@
-// AnyPhraseRecovery v0.4.8 — sweep funds out of a compromised webWallet seed and restore
+// AnyPhraseRecovery v0.4.12 — sweep funds out of a compromised webWallet seed and restore
 // the host node back to its original state.
 //
 // The flow REQUIRES two node restarts (after each megammrsync). State is persisted to
@@ -76,9 +76,13 @@ const state = {
   // status ∈ { "pending" | "sent" | "failed" }
   sweepProgress: null,          // null = no sweep started; [] = sweep started, no entries yet
 
+  // PERSISTED — user-supplied custom destination (overrides destinationMx for sweep).
+  // Must be persisted: a partial sweep + restart would otherwise silently re-route
+  // remaining tokens to the host's default address with no UI hint of the change.
+  customDest: null,
+
   // EPHEMERAL (per-session) — these are rebuilt on resume by the relevant enter*Step()
   compromisedSeed: null,        // only used to issue megammrsync, never persisted
-  customDest: null,
   balances: [],
   importedAddresses: [],        // rebuilt by loadSweepBalance() on resume
   megammrDownloadPath: null,    // captured from MDS.file.download response (megammr tab)
@@ -105,6 +109,7 @@ function savePersisted() {
       pendingStartedAt: state.pendingStartedAt,
       inflightCommandLabel: state.inflightCommandLabel,
       sweepProgress: state.sweepProgress,
+      customDest: state.customDest,
     }));
   } catch (_e) { /* localStorage may be unavailable; flow degrades but won't crash */ }
 }
@@ -140,6 +145,7 @@ function clearPersisted() {
   state.pendingStartedAt = null;
   state.inflightCommandLabel = null;
   state.sweepProgress = null;
+  state.customDest = null;
   state.megammrDownloadPath = null;
 }
 
@@ -157,12 +163,21 @@ function markPendingApprovedPersisted() {
   state.pendingApprovedAt = Date.now();
   savePersisted();
 }
-function clearPendingPersisted() {
+// Clears the persisted pending fields WITHOUT writing to localStorage. Use this
+// when the caller is about to write some other state (e.g. a stage advance) and
+// wants the pending-clear and the stage update to land in localStorage as a
+// single atomic write — closes the window where a dapp kill between two
+// separate writes could leave the node holding the compromised seed but the
+// dapp at "welcome".
+function clearPendingPersistedFields() {
   state.pendingUid = null;
   state.pendingLabel = null;
   state.pendingIsLongRunning = false;
   state.pendingApprovedAt = null;
   state.pendingStartedAt = null;
+}
+function clearPendingPersisted() {
+  clearPendingPersistedFields();
   savePersisted();
 }
 
@@ -328,6 +343,12 @@ let pendingState = {
                               // a brief window to say "I actually denied" before auto-approve
   timer: null,                // setInterval handle for polling
   isLongRunning: false,       // true for megammrsync (post-approval wait required)
+  onApprovedHook: null,       // optional callback fired by onPendingApproved AFTER
+                              // approvedAt is persisted. Hooks must be UI-only —
+                              // do NOT mutate persisted state from here (the ordering
+                              // contract is "approval persisted, then UI updated").
+                              // Used by resumeXxxPending to swap inline status /
+                              // start the live terminal once approval is detected.
 };
 
 function clearPendingTimer() {
@@ -344,6 +365,7 @@ function resetPendingState() {
   pendingState.approvedAt = null;
   pendingState.confirmingDetectedAt = null;
   pendingState.isLongRunning = false;
+  pendingState.onApprovedHook = null;
   pendingNullCount = 0;
 }
 
@@ -427,7 +449,14 @@ function extractPendingUid(r) {
   if (typeof r.pending === "string") return r.pending.toLowerCase();
   if (r.pending && r.pending.uid) return String(r.pending.uid).toLowerCase();
   const errMsg = r.error || "";
-  const m = errMsg.match(/0x[A-Fa-f0-9]{20,}/);
+  // Prefer a pending-context match — an unrelated 0x… in an error message
+  // (block hash, address, txid) would otherwise be latched as the UID and
+  // checkpending would falsely return "not pending" on every poll.
+  const ctx = errMsg.match(/pending\s*(?:uid|id)[:\s=]+(0x[A-Fa-f0-9]+)/i);
+  if (ctx) return ctx[1].toLowerCase();
+  // Fallback: a long 0x… blob (UIDs are typically 64 hex chars; require ≥40
+  // to avoid latching short addresses or hashes).
+  const m = errMsg.match(/0x[A-Fa-f0-9]{40,}/);
   if (m) return m[0].toLowerCase();
   return "(unknown)";
 }
@@ -555,6 +584,12 @@ function onPendingApproved() {
   if (pendingState.approvedAt) return;
   pendingState.approvedAt = Date.now();
   markPendingApprovedPersisted();
+  // Fire the approval hook BEFORE the long-running branch updates the bar — the
+  // hook is how resume*Pending swaps its inline "still pending approval" status
+  // for "approved — running on node" and surfaces the live terminal.
+  if (pendingState.onApprovedHook) {
+    try { pendingState.onApprovedHook(); } catch (_e) { /* hook errors are non-fatal */ }
+  }
   if (pendingState.isLongRunning) {
     showPendingBar(
       pendingState.label,
@@ -572,11 +607,27 @@ function onPendingApproved() {
 function finalisePendingSuccess() {
   if (!pendingState.resolve) return;
   const resolve = pendingState.resolve;
-  diagLog("PENDING-RESOLVED", { uid: pendingState.uid, label: pendingState.label });
+  const wasLongRunning = pendingState.isLongRunning;
+  diagLog("PENDING-RESOLVED", {
+    uid: pendingState.uid, label: pendingState.label, longRunning: wasLongRunning,
+  });
   hidePendingBar();
   resetPendingState();
-  clearPendingPersisted();
-  resolve({ status: true, response: { pendingResolved: true } });
+  // For SHORT-running commands (send, backup), the resolve handler can't reach
+  // a state-mutating step before the caller's await fires, so it's safe to
+  // clear persisted pending here.
+  // For LONG-running commands (megammrsync), defer the clear so the caller
+  // can advance the stage and clear pending in a SINGLE localStorage write —
+  // see the comment on clearPendingPersistedFields. The resolved value carries
+  // a flag telling the caller it owns the clear.
+  if (!wasLongRunning) {
+    clearPendingPersisted();
+  }
+  resolve({
+    status: true,
+    response: { pendingResolved: true },
+    _pendingDeferredClear: wasLongRunning,
+  });
 }
 
 function onPendingManualApprove() {
@@ -623,7 +674,7 @@ function onPendingDismiss() {
 async function cmd(c, opts) {
   opts = opts || {};
   const timeoutMs = opts.timeout
-    || (isLongRunningCommand(c) || /^backup /.test(c) ? CMD_TIMEOUT_MS_LONG : CMD_TIMEOUT_MS_DEFAULT);
+    || (isLongRunningCommand(c) || /^(backup|restore) /.test(c) ? CMD_TIMEOUT_MS_LONG : CMD_TIMEOUT_MS_DEFAULT);
   const cmdLabel = (c.split(" ")[0] || c).slice(0, 32);
 
   diagLog("CMD→", maskCommand(c));
@@ -663,13 +714,19 @@ async function cmd(c, opts) {
 }
 
 // Read-only commands cannot pend; skip the inflight hint for them.
+// NOTE: `keys` is read-only ONLY when invoked WITHOUT `action:` — `keys action:genkey`
+// is a write that derives a new key (the very command the original webwallet used
+// to leak seeds). Treat any keys-with-action as a write so inflight tracking applies.
 const READ_ONLY_CMDS_SET = new Set([
   "balance", "getaddress", "scripts", "status", "block", "history", "coins",
   "checkmode", "checkpending", "tokens", "txnlist", "keys",
 ]);
 function isReadOnlyCmd(c) {
-  const head = (String(c).trim().split(/\s+/)[0] || "").toLowerCase();
-  return READ_ONLY_CMDS_SET.has(head);
+  const trimmed = String(c).trim();
+  const head = (trimmed.split(/\s+/)[0] || "").toLowerCase();
+  if (!READ_ONLY_CMDS_SET.has(head)) return false;
+  if (head === "keys" && /\baction:/i.test(trimmed)) return false;
+  return true;
 }
 
 // ============================================================================
@@ -740,6 +797,11 @@ function show(stepId) {
   const el = $("step-" + stepId);
   if (el) el.classList.add("active");
   window.scrollTo(0, 0);
+  // Show the global Start over button on every non-welcome step so the user
+  // always has an escape hatch from a stuck or unwanted resume. Welcome already
+  // surfaces a Clear-saved-state action under its Advanced disclosure.
+  const resetBtn = $("global-reset-btn");
+  if (resetBtn) resetBtn.hidden = (stepId === "welcome");
 }
 
 function showTab(name) {
@@ -765,14 +827,23 @@ function genPassword(len) {
   len = len || 20;
   // omit easily-confused chars to make handwritten transcription reliable
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
-  const buf = new Uint8Array(len);
-  if (window.crypto && window.crypto.getRandomValues) {
-    window.crypto.getRandomValues(buf);
-  } else {
-    for (let i = 0; i < len; i++) buf[i] = Math.floor(Math.random() * 256);
-  }
+  // Rejection sample to remove modulo bias: 256 % 55 = 36 would otherwise
+  // make the first 36 chars 25% more likely than the rest.
+  const cap = chars.length * Math.floor(256 / chars.length);   // 220
+  const haveCrypto = !!(window.crypto && window.crypto.getRandomValues);
   let out = "";
-  for (let i = 0; i < len; i++) out += chars[buf[i] % chars.length];
+  while (out.length < len) {
+    const need = len - out.length;
+    const buf = new Uint8Array(need * 2);                       // overshoot to reduce reroll cost
+    if (haveCrypto) {
+      window.crypto.getRandomValues(buf);
+    } else {
+      for (let i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256);
+    }
+    for (let i = 0; i < buf.length && out.length < len; i++) {
+      if (buf[i] < cap) out += chars[buf[i] % chars.length];
+    }
+  }
   return out;
 }
 
@@ -1041,9 +1112,12 @@ async function onRunSync() {
     appendLog("sync-log", JSON.stringify(r.response || r, null, 2));
     stopLiveTerminal("sync complete");
 
-    // Sync truly completed (cmd resolved). NOW advance the stage.
+    // Sync truly completed (cmd resolved). NOW advance the stage. If the cmd
+    // resolved via the deferred-clear pending path, clear those fields as part
+    // of the same write so a kill between two saves can't drop the stage.
     state.stage = "import_sync_done";
     state.compromisedSeed = null;
+    if (r && r._pendingDeferredClear) clearPendingPersistedFields();
     savePersisted();
 
     setStatus("sync-status", "Sync complete. Restart Minima now.", "ok");
@@ -1074,7 +1148,7 @@ function enterReboot1() {
 async function enterSweepStep() {
   show("sweep");
   setStatus("sweep-loading-status", "Loading balance from the imported wallet…");
-  $("sweep-dest").textContent = state.destinationMx || "(unknown — clear saved state and start over)";
+  $("sweep-dest").textContent = getDestination() || "(unknown — clear saved state and start over)";
   $("sweep-balance").innerHTML = "";
   $("sweep-confirm-block").hidden = true;
   $("sweep-empty-warn").hidden = true;
@@ -1082,6 +1156,15 @@ async function enterSweepStep() {
   $("sweep-results").innerHTML = "";
   $("sweep-next-row").hidden = true;
   $("sweep-status").textContent = "";
+
+  // If a custom destination was persisted (set in a previous session), restore the
+  // advanced UI so the user can see they're sweeping there — and so any retry of
+  // failed/pending tokens uses the same destination as the first attempt.
+  if (state.customDest) {
+    const input = $("custom-dest-input");
+    if (input) input.value = state.customDest;
+    $("custom-dest-confirm-row").hidden = false;
+  }
 
   try {
     await loadSweepBalance();
@@ -1225,6 +1308,7 @@ function onCustomDestSet() {
     return;
   }
   state.customDest = v;
+  savePersisted();
   $("custom-dest-confirm-row").hidden = false;
   $("confirm-custom-dest").checked = false;
   setStatus("sweep-status", "Custom destination set: " + v + ".", "warn");
@@ -1233,8 +1317,10 @@ function onCustomDestSet() {
 
 function onCustomDestClear() {
   state.customDest = null;
+  savePersisted();
   $("custom-dest-confirm-row").hidden = true;
   $("confirm-custom-dest").checked = false;
+  $("custom-dest-input").value = "";
   setStatus("sweep-status", "Reset destination to your wallet's address.", "ok");
   updateSweepEnabled();
 }
@@ -1333,13 +1419,16 @@ async function onSweep() {
 
 function onSweepNext() {
   // If any token failed to send, warn before proceeding — funds remain at the
-  // compromised wallet for any failed token and won't be recovered.
-  const results = $("sweep-results");
-  const failedRows = results ? results.querySelectorAll(".sweep-result.err").length : 0;
-  if (failedRows > 0) {
+  // compromised wallet for any failed token and won't be recovered. Read from
+  // sweepProgress (source of truth), not the DOM — a render path that omits
+  // the .err class would otherwise silently bypass the warning.
+  const unfinished = (state.sweepProgress || []).filter(
+    e => e.status !== "sent"
+  );
+  if (unfinished.length > 0) {
     if (!confirm(
-      failedRows + " token(s) failed to send and remain at the compromised address. " +
-      "Continuing to restore now will leave them stranded. Continue anyway?"
+      unfinished.length + " token(s) did not complete a successful send and remain at the " +
+      "compromised address. Continuing to restore now will leave them stranded. Continue anyway?"
     )) return;
   }
   show("restore");
@@ -1347,7 +1436,7 @@ function onSweepNext() {
 }
 
 // ============================================================================
-// Step 5 — restore via megammrsync(file:+password:)
+// Step 5 — restore via `restore file:.. password:..` (local .bak, no host)
 // ============================================================================
 
 let restoreCountdownTimer = null;
@@ -1391,24 +1480,26 @@ function enterRestoreStep() {
 
 async function onRestoreRun() {
   $("restore-run-btn").disabled = true;
-  setStatus("restore-status", "Restoring via megammrsync — this can take a minute…");
-  startLiveTerminal("restore-log", "megammrsync action:resync (restoring from snapshot)");
-  appendLog("restore-log", "> megammrsync action:resync host:" + state.selectedHost +
-                          " file:" + state.backupFile + " password:<hidden>");
+  setStatus("restore-status", "Restoring from local snapshot — this can take a minute…");
+  startLiveTerminal("restore-log", "restore (from local snapshot)");
+  appendLog("restore-log", "> restore file:" + state.backupFile + " password:<hidden>");
   try {
     // NOTE: stage is NOT advanced before await — same reasoning as onRunSync.
     // If we set "restore_sync_done" pre-await and the user closed during the
     // pending wait, resume would jump to verify thinking restore had completed.
 
-    const c = "megammrsync action:resync host:" + state.selectedHost +
-              " file:" + state.backupFile +
+    // Local `restore` (no host needed) — restores from the encrypted .bak file
+    // produced by the snapshot step. Doesn't require any megammr round-trip.
+    const c = "restore file:" + state.backupFile +
               " password:" + state.backupPassword;
     const r = await cmd(c);
     appendLog("restore-log", JSON.stringify(r.response || r, null, 2));
     stopLiveTerminal("restore complete");
 
-    // Restore truly completed. NOW advance the stage.
+    // Restore truly completed. NOW advance the stage. Clear the deferred
+    // pending fields atomically with the stage save (same reasoning as onRunSync).
     state.stage = "restore_sync_done";
+    if (r && r._pendingDeferredClear) clearPendingPersistedFields();
     savePersisted();
 
     setStatus("restore-status", "Restore command returned. Restart Minima now.", "ok");
@@ -1494,8 +1585,7 @@ async function enterVerifyStep() {
   } else {
     $("verify-failure").hidden = false;
     $("verify-failure-cmd").textContent =
-      "megammrsync action:resync host:" + (state.selectedHost || "<host>") +
-      " file:" + (state.backupFile || "<backup>") +
+      "restore file:" + (state.backupFile || "<backup>") +
       " password:" + (state.backupPassword || "<password>");
     $("verify-failure-state").textContent = persistedAsString();
     setStatus("verify-status", "Verification failed — see options below.", "err");
@@ -1665,9 +1755,8 @@ async function mmImport() {
 async function mmNetinfo() {
   $("mm-netinfo").textContent = "Loading…";
   try {
-    const [maxR, , statusR] = await Promise.all([
+    const [maxR, statusR] = await Promise.all([
       cmd("maxima action:info").catch(() => null),
-      cmd("network action:list").catch(() => null),
       cmd("status").catch(() => null),
     ]);
     const lines = [];
@@ -1698,6 +1787,14 @@ function wireUp() {
   // Step 0
   $("welcome-start-btn").addEventListener("click", onWelcomeStart);
   $("welcome-clear-btn").addEventListener("click", onWelcomeClear);
+
+  // Global escape hatch — visible from every non-welcome step
+  $("global-reset-btn").addEventListener("click", () => {
+    if (confirm(
+      "Wipe all saved recovery state (backup credentials, host, sweep progress, " +
+      "destination) and return to the welcome screen?"
+    )) onWelcomeClear();
+  });
 
   // Step 1
   $("snap-back-btn").addEventListener("click", () => show("welcome"));
@@ -1912,8 +2009,11 @@ function resumePendingByLabel() {
   diagLog("RESUME-PENDING", { label: label, stage: state.stage });
   if (label === "backup")      return resumeBackupPending();
   if (label === "send")        return resumeSendPending();
+  if (label === "restore")     return resumeRestorePending();
   if (label === "megammrsync") {
-    // Disambiguate by stage: pre-swept = import sync; post-swept = restore sync
+    // Disambiguate by stage: pre-swept = import sync; post-swept = restore sync.
+    // The "swept + megammrsync" case is legacy (≤ v0.4.9) — restore now uses
+    // the plain `restore` label above. Kept for users mid-flow on an older build.
     if (state.stage === "swept") return resumeRestorePending();
     return resumeSyncPending();
   }
@@ -1986,12 +2086,41 @@ function resumeSyncPending() {
   }
   $("selected-host").textContent = state.selectedHost || "(unknown)";
   $("sync-run-btn").disabled = true;   // already in flight; can't re-run
-  setStatus("sync-status",
-    "Welcome back — megammrsync is still pending approval (banner above shows steps).", "warn");
+
+  // Once approval is detected, swap the inline status from "still pending" to
+  // "approved — running on node" and surface the live terminal so the user
+  // sees activity (matches what onRunSync would show in a no-restart flow).
+  const onApproved = () => {
+    setStatus("sync-status",
+      "Approved — megammrsync is running on the node. Do NOT restart yet (banner above shows the countdown).",
+      "ok");
+    const log = $("sync-log");
+    if (log) {
+      log.hidden = false;
+      log.textContent = "";
+    }
+    startLiveTerminal("sync-log", "megammrsync running on node (post-approval wait)");
+  };
+
+  // If approval already happened in a previous session and we resumed mid-wait,
+  // fire the post-approval status immediately. Otherwise install it as a hook
+  // for when onPendingApproved fires.
+  if (state.pendingApprovedAt) {
+    onApproved();
+  } else {
+    setStatus("sync-status",
+      "Welcome back — megammrsync is still pending approval (banner above shows steps).", "warn");
+    pendingState.onApprovedHook = onApproved;
+  }
+
   awaitPendingThen(() => {
+    // Long-running pending: finalisePendingSuccess deferred the clear so we
+    // can land stage and pending-clear in a single localStorage write.
     state.stage = "import_sync_done";
     state.compromisedSeed = null;
+    clearPendingPersistedFields();
     savePersisted();
+    stopLiveTerminal("sync complete");
     enterReboot1();
   }, () => {
     setStatus("sync-status",
@@ -2002,11 +2131,49 @@ function resumeSyncPending() {
 
 function resumeRestorePending() {
   show("restore");
-  setStatus("restore-status",
-    "Welcome back — restore is still pending approval (banner above shows steps).", "warn");
+
+  // Two distinct cases handled by this hook:
+  //   isLongRunning=true  → legacy megammrsync-based restore (≤ v0.4.9). Real
+  //                          90s post-approval wait while the resync runs on
+  //                          the node — surface the live terminal and warn the
+  //                          user not to restart yet.
+  //   isLongRunning=false → current short-running `restore` command. Resolves
+  //                          essentially immediately after approval; the
+  //                          awaitPendingThen `next` will flip to reboot2
+  //                          within one microtask. Just say "finishing" — no
+  //                          point spinning up a live terminal we'd hide
+  //                          before the user could read it.
+  const onApproved = () => {
+    if (pendingState.isLongRunning) {
+      setStatus("restore-status",
+        "Approved — restore is running on the node, ~" + MEGAMMRSYNC_RUN_SECONDS +
+        "s remaining. Do NOT restart yet (banner above shows the countdown).", "ok");
+      const log = $("restore-log");
+      if (log) {
+        log.hidden = false;
+        log.textContent = "";
+      }
+      startLiveTerminal("restore-log", "restore running on node (post-approval wait)");
+    } else {
+      setStatus("restore-status", "Approved — finishing restore…", "ok");
+    }
+  };
+
+  if (state.pendingApprovedAt) {
+    onApproved();
+  } else {
+    setStatus("restore-status",
+      "Welcome back — restore is still pending approval (banner above shows steps).", "warn");
+    pendingState.onApprovedHook = onApproved;
+  }
+
   awaitPendingThen(() => {
+    // Land stage and pending-clear in a single localStorage write — works for
+    // both short-running `restore` (current) and long-running megammrsync (legacy).
     state.stage = "restore_sync_done";
+    clearPendingPersistedFields();
     savePersisted();
+    stopLiveTerminal("restore complete");
     show("reboot2");
   }, () => {
     setStatus("restore-status",

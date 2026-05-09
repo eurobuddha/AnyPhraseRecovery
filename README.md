@@ -35,8 +35,8 @@ to weeks after the user's last legitimate webwallet activity.
               import the compromised wallet onto the host node.
               (The node restarts.)
 3. SWEEP    ─ send all recovered balances to the host node's own existing address.
-4. RESTORE  ─ run megammrsync(action:resync, file:<backup>, password:<password>)
-              to bring the host node back to its original seed and chain state.
+4. RESTORE  ─ run `restore file:<backup> password:<password>` to bring the host
+              node back to its original seed and chain state from the local .bak.
               (The node restarts again.)
 5. VERIFY   ─ confirm the original wallet identity is back; the recovered funds
               are now sitting at the user's normal address.
@@ -98,7 +98,7 @@ original wallet:
 1. **The encrypted .bak file**. The dapp shows the absolute path; the user wrote
    the password down on paper. From the terminal:
    ```
-   megammrsync action:resync host:<host> file:<backup-path> password:<password>
+   restore file:<backup-path> password:<password>
    ```
    then restart.
 
