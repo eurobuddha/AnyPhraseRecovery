@@ -521,6 +521,115 @@ ol.explainer-numbered strong { color: var(--accent); }
   letter-spacing: 0.5px;
 }
 
+/* Sticky pending banner — fixed to top of viewport, always visible */
+.pending-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  background: linear-gradient(180deg, #ffb547 0%, #f59e0b 100%);
+  color: #0e1116;
+  border-bottom: 2px solid #b45309;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  animation: pending-pulse 2s ease-in-out infinite;
+}
+@keyframes pending-pulse {
+  0%, 100% { box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
+  50% { box-shadow: 0 4px 24px rgba(255, 181, 71, 0.6); }
+}
+.pending-bar-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 12px 16px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.pending-bar-spinner {
+  font-size: 26px;
+  flex-shrink: 0;
+  animation: pending-spin 2s linear infinite;
+}
+@keyframes pending-spin {
+  0%, 100% { transform: rotate(0deg); }
+  50%      { transform: rotate(15deg); }
+}
+.pending-bar-text { flex: 1; min-width: 0; }
+.pending-bar-title {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.3px;
+}
+.pending-bar-detail {
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-top: 2px;
+  opacity: 0.75;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.pending-bar-uid {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.pending-bar-poll {
+  font-size: 11px;
+  margin-top: 3px;
+  opacity: 0.7;
+  font-style: italic;
+}
+.pending-bar-dismiss {
+  background: transparent;
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  color: #0e1116;
+  font-size: 18px;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+  font-weight: 700;
+}
+.pending-bar-dismiss:hover { background: rgba(0, 0, 0, 0.1); }
+
+/* When pending bar is visible, push main content down */
+body:has(.pending-bar:not([hidden])) main { padding-top: 80px; }
+body:has(.pending-bar:not([hidden])) header { padding-top: 80px; }
+
+/* Diagnostic console */
+#diag-console {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  background: #0a0d12;
+  border-top: 1px solid var(--border);
+  max-height: 50vh;
+  overflow: auto;
+  padding: 0;
+}
+#diag-console > summary {
+  padding: 8px 16px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  background: var(--panel);
+  user-select: none;
+  list-style: none;
+}
+#diag-console > summary::-webkit-details-marker { display: none; }
+#diag-console[open] > summary { border-bottom: 1px solid var(--border); }
+#diag-console > summary::before { content: "▸  "; }
+#diag-console[open] > summary::before { content: "▾  "; }
+#diag-console pre { margin: 0; padding: 10px 16px; max-height: 35vh; }
+#diag-console .actions { padding: 8px 16px; }
+body { padding-bottom: 40px; }
+
 /* Reboot interstitial card */
 .reboot-card {
   text-align: center;

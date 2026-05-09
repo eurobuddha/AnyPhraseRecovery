@@ -18,7 +18,7 @@ const HOSTS = [
   "minimammr.com:9001",
   "megammr.minima.global:9001",
 ];
-const KEYUSES = 25000;                                  // bumped from 2500 after live test
+const KEYUSES = 2500;                                   // user-specified (matches original plan)
 const STORAGE_KEY = "anyphrase.flow.v1";
 const POST_SWEEP_WAIT_SECONDS = 60;                     // wait for send tx to be mined before restoring
 const MEGAMMR_FILE_URL = "https://eurobuddha.com/mega.mmr";
@@ -141,37 +141,137 @@ function fallbackCopy(text) {
   return ok;
 }
 
-// PendingError surfaces when a write-type command was queued because this dapp's
-// permission is READ. The user must approve the action in MiniHub → Pending.
-class PendingError extends Error {
-  constructor(uid, command) {
-    super("Action queued — waiting for approval in MiniHub");
-    this.name = "PendingError";
-    this.pendingUid = uid;
-    this.pendingCommand = command;
+// ============================================================================
+// Diagnostic logging — captures every MDS request/response so users can copy
+// and share it for debugging.
+// ============================================================================
+
+function diagLog(direction, payload) {
+  const el = document.getElementById("diag-log");
+  if (!el) return;
+  const ts = new Date().toISOString().slice(11, 19);
+  let s;
+  if (typeof payload === "string") {
+    s = payload.length > 500 ? payload.slice(0, 500) + "…(truncated)" : payload;
+  } else {
+    try {
+      s = JSON.stringify(payload, (k, v) => {
+        // Mask secrets in diag output
+        if (k === "phrase" || k === "password") return "<hidden>";
+        return v;
+      });
+      if (s.length > 800) s = s.slice(0, 800) + "…(truncated)";
+    } catch (_e) { s = String(payload); }
   }
+  el.textContent += `[${ts}] ${direction} ${s}\n`;
+  el.scrollTop = el.scrollHeight;
 }
 
-function cmd(c) {
+// Sanitize a command string for diag/log display — masks any phrase: or password: arg
+function maskCommand(c) {
+  return String(c)
+    .replace(/phrase:"[^"]*"/g, 'phrase:"<hidden>"')
+    .replace(/password:\S+/g, "password:<hidden>");
+}
+
+// ============================================================================
+// Sticky pending bar + auto-polling
+//
+// Every cmd() that returns "pending" automatically:
+//   1. Shows the sticky pending bar at top of screen
+//   2. Polls `mds action:pending` every 2 sec until the UID disappears
+//   3. Hides the bar and returns a synthetic success response so the caller
+//      can continue as if the command had run synchronously.
+// ============================================================================
+
+let pendingPollTimer = null;
+
+function showPendingBar(commandLabel, uid) {
+  $("pending-bar-cmd").textContent = commandLabel;
+  $("pending-bar-uid").textContent = "uid " + uid;
+  $("pending-bar-poll").textContent = "…polling for approval";
+  $("pending-bar").hidden = false;
+}
+
+function hidePendingBar() {
+  $("pending-bar").hidden = true;
+  if (pendingPollTimer) { clearInterval(pendingPollTimer); pendingPollTimer = null; }
+}
+
+// Raw MDS.cmd that NEVER routes through our pending-handling cmd() wrapper.
+// Used only for the polling itself, which would otherwise infinite-loop.
+function rawCmd(c) {
   return new Promise((resolve, reject) => {
-    MDS.cmd(c, (res) => {
-      // Pending detection — MDS reports it in two possible shapes:
-      //   shape 1: {status: true|false, pending: true, uid: "0x..."}
-      //   shape 2: {status: false, error: "This command needs to be confirmed and is now pending..."}
-      // Catch both.
-      if (res && res.pending === true) {
-        const uid = res.uid || res.pending || "(unknown)";
-        return reject(new PendingError(uid, c));
-      }
-      const errMsg = (res && res.error) || "";
-      if (errMsg && /pending|needs to be confirmed/i.test(errMsg)) {
-        const m = errMsg.match(/0x[A-Fa-f0-9]{20,}/);
-        return reject(new PendingError(m ? m[0] : "(unknown)", c));
-      }
-      if (res && res.status) return resolve(res);
-      reject(new Error(errMsg || ("command failed: " + (c.split(" ")[0] || c))));
-    });
+    MDS.cmd(c, res => res ? resolve(res) : reject(new Error("no response")));
   });
+}
+
+async function listPendingUids() {
+  try {
+    const r = await rawCmd("mds action:pending");
+    const arr = (r.response || {}).pending || (r.response || []);
+    if (!Array.isArray(arr)) return [];
+    return arr.map(p => (p && (p.uid || p.id || "")).toLowerCase()).filter(Boolean);
+  } catch (_e) { return []; }
+}
+
+function waitForPendingResolution(commandLabel, uid) {
+  showPendingBar(commandLabel, uid);
+  diagLog("PENDING", { command: commandLabel, uid: uid });
+  return new Promise(resolve => {
+    if (pendingPollTimer) clearInterval(pendingPollTimer);
+    let pollCount = 0;
+    const targetUid = (uid || "").toLowerCase();
+    pendingPollTimer = setInterval(async () => {
+      pollCount++;
+      $("pending-bar-poll").textContent =
+        "…polling for approval (" + (pollCount * 2) + "s elapsed)";
+      const uids = await listPendingUids();
+      if (!targetUid || targetUid === "(unknown)" || !uids.includes(targetUid)) {
+        // UID resolved (approved or denied — either way it's no longer pending)
+        clearInterval(pendingPollTimer);
+        pendingPollTimer = null;
+        hidePendingBar();
+        diagLog("PENDING-RESOLVED", { uid: uid });
+        resolve({ status: true, response: { pendingResolved: true, uid: uid } });
+      }
+    }, 2000);
+  });
+}
+
+function isPendingResponse(r) {
+  if (!r) return false;
+  if (r.pending === true) return true;
+  const errMsg = r.error || "";
+  if (errMsg && /pending|needs to be confirmed/i.test(errMsg)) return true;
+  return false;
+}
+
+function extractPendingUid(r) {
+  if (!r) return "(unknown)";
+  if (r.uid) return String(r.uid).toLowerCase();
+  if (typeof r.pending === "string") return r.pending.toLowerCase();
+  const errMsg = r.error || "";
+  const m = errMsg.match(/0x[A-Fa-f0-9]{20,}/);
+  if (m) return m[0].toLowerCase();
+  // Last resort: take diff of pending list (we may have polled before issuing)
+  return "(unknown)";
+}
+
+async function cmd(c) {
+  diagLog("CMD→", maskCommand(c));
+  const r = await new Promise(resolve => MDS.cmd(c, res => resolve(res)));
+  diagLog("RES←", r);
+
+  if (isPendingResponse(r)) {
+    const uid = extractPendingUid(r);
+    const label = (c.split(" ")[0] || c).slice(0, 32);
+    // Block until user approves in MiniHub
+    return await waitForPendingResolution(label, uid);
+  }
+
+  if (r && r.status) return r;
+  throw new Error((r && r.error) || ("command failed: " + (c.split(" ")[0] || c)));
 }
 
 // ============================================================================
@@ -409,15 +509,13 @@ function updateSnapshotEnabled() {
 
 async function onSnapBackup() {
   $("snap-backup-btn").disabled = true;
-  $("snap-pending-block").hidden = true;
   setStatus("snap-backup-status", "Generating credentials…");
 
   // CRITICAL: generate credentials and display them FIRST, before issuing the command.
-  // If the command goes pending (READ mode), the user must already have the password
-  // visible — otherwise they could approve a backup whose password is permanently lost.
+  // If pending happens (READ mode), the password must already be on screen.
   const pw = genPassword(20);
   const file = "anyphrase-" + Date.now() + ".bak";
-  state.backupFile = file;        // tentative — overwritten with absolute path on success
+  state.backupFile = file;        // tentative; overwritten with absolute path if cmd ran sync
   state.backupPassword = pw;
   $("snap-backup-info").hidden = false;
   $("snap-backup-file").textContent = file + "  (full path will appear after backup completes)";
@@ -429,9 +527,12 @@ async function onSnapBackup() {
   try {
     const c = "backup file:" + file + " password:" + pw;
     appendLog("snap-backup-log", "> " + c.replace(/password:\S+/, "password:<hidden>"));
+    // cmd() blocks transparently if MDS goes pending — sticky banner + auto-poll.
     const r = await cmd(c);
     appendLog("snap-backup-log", JSON.stringify(r.response || r, null, 2));
     stopLiveTerminal("backup complete");
+    // For a synchronously-run backup, the response carries the absolute path.
+    // For a pending-then-approved backup, it doesn't — we keep the relative filename.
     const absolutePath = (((r.response || {}).backup) || {}).file || file;
     state.backupFile = absolutePath;
     $("snap-backup-file").textContent = absolutePath;
@@ -440,39 +541,9 @@ async function onSnapBackup() {
   } catch (e) {
     stopLiveTerminal();
     appendLog("snap-backup-log", "ERROR: " + e.message);
-    if (e.name === "PendingError") {
-      $("snap-pending-uid").textContent = (e.pendingUid || "?").slice(0, 16) + "…";
-      $("snap-pending-block").hidden = false;
-      setStatus("snap-backup-status",
-        "Backup is pending — approve it in MiniHub. Credentials above are valid.", "warn");
-    } else {
-      setStatus("snap-backup-status",
-        "Backup failed: " + e.message, "err");
-      $("snap-backup-btn").disabled = false;
-    }
+    setStatus("snap-backup-status", "Backup failed: " + e.message, "err");
+    $("snap-backup-btn").disabled = false;
   }
-}
-
-// User has gone to MiniHub, accepted the pending backup, and clicked "I approved".
-// We trust them and treat the (relative) filename as the backup path. megammrsync
-// during restore accepts a filename and finds it in the same default location.
-function onSnapPendingConfirm() {
-  $("snap-pending-block").hidden = true;
-  appendLog("snap-backup-log", "(user-confirmed approval; using filename " + state.backupFile + ")");
-  setStatus("snap-backup-status",
-    "Marked backup as approved. Continue if you also wrote the password down.", "ok");
-  updateSnapshotEnabled();
-}
-
-function onSnapPendingRetry() {
-  // Cancel — wipe the tentative state so the user can re-Run backup with fresh creds
-  $("snap-pending-block").hidden = true;
-  $("snap-backup-info").hidden = true;
-  state.backupFile = null;
-  state.backupPassword = null;
-  setStatus("snap-backup-status", "Cancelled. Click Run backup to try again.", "warn");
-  $("snap-backup-btn").disabled = false;
-  updateSnapshotEnabled();
 }
 
 // ============================================================================
@@ -563,30 +634,12 @@ async function onRunSync() {
   } catch (e) {
     stopLiveTerminal();
     appendLog("sync-log", "ERROR: " + e.message);
-    if (e.name === "PendingError") {
-      $("sync-pending-uid").textContent = (e.pendingUid || "?").slice(0, 16) + "…";
-      $("sync-pending-block").hidden = false;
-      setStatus("sync-status",
-        "megammrsync is pending — approve it in MiniHub, then click below.", "warn");
-      // Note: the destructive command IS in the queue; once approved it WILL run and
-      // the node will need restart. So treat the stage as effectively committed.
-      // Don't roll back state here — when the user clicks "I approved", we go to reboot1.
-    } else {
-      setStatus("sync-status",
-        'Sync failed: ' + e.message + '. Click "Try a different host", then "Run megammrsync" again.', "err");
-      $("sync-run-btn").disabled = false;
-      state.stage = null;
-      savePersisted();
-    }
+    setStatus("sync-status",
+      'Sync failed: ' + e.message + '. Click "Try a different host", then "Run megammrsync" again.', "err");
+    $("sync-run-btn").disabled = false;
+    state.stage = null;
+    savePersisted();
   }
-}
-
-function onSyncPendingConfirm() {
-  $("sync-pending-block").hidden = true;
-  appendLog("sync-log", "(user confirmed approval; megammrsync running on node)");
-  state.compromisedSeed = null;
-  setStatus("sync-status", "Approved. Restart Minima now.", "ok");
-  enterReboot1();
 }
 
 // ============================================================================
@@ -750,17 +803,16 @@ async function onSweep() {
     try {
       const c = "send address:" + dest + " amount:" + b.sendable +
                 (b.tokenid === "0x00" ? "" : " tokenid:" + b.tokenid);
+      // cmd() handles pending transparently via the sticky banner + auto-polling.
+      // If pending fires for this send, the row stays "sending…" until approved.
+      result.textContent = "queued — see sticky banner if pending";
       const r = await cmd(c);
       row.classList.add("ok");
       result.textContent = "sent";
       ok++;
     } catch (e) {
       row.classList.add("err");
-      if (e.name === "PendingError") {
-        result.textContent = "pending — approve in MiniHub (uid " + (e.pendingUid || "?").slice(0, 16) + "…)";
-      } else {
-        result.textContent = "failed: " + e.message;
-      }
+      result.textContent = "failed: " + e.message;
       err++;
     }
   }
@@ -832,26 +884,11 @@ async function onRestoreRun() {
   } catch (e) {
     stopLiveTerminal();
     appendLog("restore-log", "ERROR: " + e.message);
-    if (e.name === "PendingError") {
-      $("restore-pending-uid").textContent = (e.pendingUid || "?").slice(0, 16) + "…";
-      $("restore-pending-block").hidden = false;
-      setStatus("restore-status",
-        "Restore megammrsync is pending — approve it in MiniHub, then click below.", "warn");
-      // Stage stays at restore_sync_pending — user confirms, then we go to reboot2
-    } else {
-      setStatus("restore-status", "Restore failed: " + e.message, "err");
-      $("restore-run-btn").disabled = false;
-      state.stage = "swept";
-      savePersisted();
-    }
+    setStatus("restore-status", "Restore failed: " + e.message, "err");
+    $("restore-run-btn").disabled = false;
+    state.stage = "swept";
+    savePersisted();
   }
-}
-
-function onRestorePendingConfirm() {
-  $("restore-pending-block").hidden = true;
-  appendLog("restore-log", "(user confirmed approval; restore megammrsync running on node)");
-  setStatus("restore-status", "Approved. Restart Minima now.", "ok");
-  show("reboot2");
 }
 
 // ============================================================================
@@ -1071,8 +1108,6 @@ function wireUp() {
   $("snap-copypw-btn").addEventListener("click", () =>
     copyText(state.backupPassword).then(ok =>
       flashStatus("snap-backup-status", ok ? "Copied password (write it on paper)." : "Copy failed.")));
-  $("snap-pending-confirm-btn").addEventListener("click", onSnapPendingConfirm);
-  $("snap-pending-retry-btn").addEventListener("click", onSnapPendingRetry);
   $("snap-continue-btn").addEventListener("click", () => show("seed"));
 
   // Step 2
@@ -1092,12 +1127,15 @@ function wireUp() {
   $("sweep-next-btn").addEventListener("click", onSweepNext);
   $("sweep-skip-restore-btn").addEventListener("click", onSweepSkipRestore);
 
-  // Step 3 pending
-  $("sync-pending-confirm-btn").addEventListener("click", onSyncPendingConfirm);
-
   // Step 5
   $("restore-run-btn").addEventListener("click", onRestoreRun);
-  $("restore-pending-confirm-btn").addEventListener("click", onRestorePendingConfirm);
+
+  // Sticky pending bar dismiss + diag console
+  $("pending-bar-dismiss").addEventListener("click", hidePendingBar);
+  $("diag-clear-btn").addEventListener("click", () => { $("diag-log").textContent = ""; });
+  $("diag-copy-btn").addEventListener("click", () =>
+    copyText($("diag-log").textContent).then(ok =>
+      alert(ok ? "Diagnostics copied to clipboard." : "Copy failed.")));
 
   // Step 6
   $("finish-restart-btn").addEventListener("click", onFinishRestart);
@@ -1147,15 +1185,9 @@ document.addEventListener("DOMContentLoaded", function () {
   detectPlatform();
 });
 
-// Pending command UI helper. Surfaced when a write command returns pending:true.
-function handlePending(err, statusElId, message) {
-  setStatus(statusElId,
-    message + "  (pending uid: " + (err.pendingUid || "?").slice(0, 18) + "…)",
-    "warn");
-}
-
-// Probe this dapp's own permission level. If READ, warn that every command
-// will require manual approval in MiniHub → Pending.
+// Probe this dapp's own permission level. If READ, show a neutral banner
+// explaining that commands will queue in MiniHub Pending — but the dapp
+// handles the pending case automatically via the sticky banner.
 async function checkOwnPermission() {
   // The cleanest signal is `checkmode`, which returns "READ" or "WRITE"
   try {

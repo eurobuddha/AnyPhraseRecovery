@@ -14,6 +14,32 @@
     <p class="sub">Sweep funds out of a compromised webWallet seed without giving up control of this Minima node.</p>
   </header>
 
+  <!-- Sticky pending banner — fixed to top, always visible while a command is queued -->
+  <div id="pending-bar" class="pending-bar" hidden>
+    <div class="pending-bar-inner">
+      <div class="pending-bar-spinner">⏳</div>
+      <div class="pending-bar-text">
+        <div class="pending-bar-title">Approve in MiniHub Pending</div>
+        <div class="pending-bar-detail">
+          <span id="pending-bar-cmd">command</span>
+          <span class="pending-bar-uid" id="pending-bar-uid">—</span>
+        </div>
+        <div class="pending-bar-poll" id="pending-bar-poll">…polling for approval</div>
+      </div>
+      <button id="pending-bar-dismiss" class="pending-bar-dismiss" title="Dismiss (you'll need to mark as approved manually)">×</button>
+    </div>
+  </div>
+
+  <!-- Diagnostic console — collapsed by default, shows raw MDS responses -->
+  <details id="diag-console">
+    <summary>Diagnostics (tap to expand — copy/paste this if reporting bugs)</summary>
+    <pre id="diag-log" class="log small"></pre>
+    <div class="actions row">
+      <button id="diag-clear-btn" class="btn">Clear</button>
+      <button id="diag-copy-btn" class="btn">Copy</button>
+    </div>
+  </details>
+
   <nav class="tabs">
     <button class="tab active" data-tab="recover">Recover funds</button>
     <button class="tab" data-tab="megammr">Become a MegaMMR host</button>
@@ -40,9 +66,9 @@
           <div class="banner warn">
             <strong>Two restarts required.</strong> The flow needs you to restart Minima twice (once after import, once after restore). The dapp remembers where you were and picks up automatically when you come back.
           </div>
-          <div id="welcome-perm-warn" class="banner danger" hidden>
-            <strong>This dapp is currently in READ mode.</strong>
-            Every action it tries to take (backup, megammrsync, send) will be queued and require manual approval in <strong>MiniHub → Pending</strong>. Highly recommended: change this dapp's permission to <strong>WRITE</strong> in MiniHub before starting, otherwise the flow will be very tedious.
+          <div id="welcome-perm-warn" class="banner" hidden>
+            <strong>This dapp is in READ mode.</strong>
+            Each action (backup, megammrsync, send) will queue in MiniHub → Pending for your approval. The dapp will pause and auto-resume itself when you approve. WRITE mode runs commands without prompting — both work; pick whichever you prefer.
           </div>
           <div class="actions row">
             <button id="welcome-start-btn" class="btn primary">Get started</button>
@@ -86,16 +112,6 @@
           </div>
           <p id="snap-backup-status" class="status"></p>
           <pre id="snap-backup-log" class="log" hidden></pre>
-
-          <div id="snap-pending-block" class="banner warn" hidden>
-            <strong>Backup is queued in MiniHub Pending.</strong>
-            <p>Open MiniHub → tap <strong>Pending</strong> → tap <strong>Accept</strong> on the backup action (uid <span id="snap-pending-uid" class="mono"></span>). Then come back here and click below.</p>
-            <p>The credentials shown above are the ones the action will use — they'll be valid once you approve.</p>
-            <div class="actions row">
-              <button id="snap-pending-confirm-btn" class="btn primary">I approved it — continue</button>
-              <button id="snap-pending-retry-btn" class="btn">Cancel and retry</button>
-            </div>
-          </div>
 
           <div id="snap-backup-info" hidden>
             <div class="field-block">
@@ -178,14 +194,6 @@
 
           <p id="sync-status" class="status"></p>
           <pre id="sync-log" class="log"></pre>
-
-          <div id="sync-pending-block" class="banner warn" hidden>
-            <strong>megammrsync is queued in MiniHub Pending.</strong>
-            <p>Open MiniHub → tap <strong>Pending</strong> → tap <strong>Accept</strong> on the megammrsync action (uid <span id="sync-pending-uid" class="mono"></span>). Then come back here and click below.</p>
-            <div class="actions row">
-              <button id="sync-pending-confirm-btn" class="btn primary">I approved it — continue to restart screen</button>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -307,14 +315,6 @@
           </div>
           <p id="restore-status" class="status"></p>
           <pre id="restore-log" class="log"></pre>
-
-          <div id="restore-pending-block" class="banner warn" hidden>
-            <strong>Restore megammrsync is queued in MiniHub Pending.</strong>
-            <p>Open MiniHub → tap <strong>Pending</strong> → tap <strong>Accept</strong> on the megammrsync action (uid <span id="restore-pending-uid" class="mono"></span>). Then come back here and click below.</p>
-            <div class="actions row">
-              <button id="restore-pending-confirm-btn" class="btn primary">I approved it — continue to restart screen</button>
-            </div>
-          </div>
         </div>
       </div>
 
