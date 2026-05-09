@@ -1,4 +1,4 @@
-// AnyPhraseRecovery v0.3 — sweep funds out of a compromised webWallet seed and restore
+// AnyPhraseRecovery v0.4.4 — sweep funds out of a compromised webWallet seed and restore
 // the host node back to its original state.
 //
 // The flow REQUIRES two node restarts (after each megammrsync). State is persisted to
@@ -55,6 +55,7 @@ const state = {
   customDest: null,
   balances: [],
   importedAddresses: [],        // rebuilt by loadSweepBalance() on resume
+  megammrDownloadPath: null,    // captured from MDS.file.download response (megammr tab)
 };
 
 // ============================================================================
@@ -93,6 +94,7 @@ function clearPersisted() {
   state.destinationMx = null;
   state.hostFingerprint = null;
   state.restoreReadyAt = null;
+  state.megammrDownloadPath = null;
 }
 
 function persistedAsString() {
@@ -117,12 +119,19 @@ function setStatus(elId, text, kind) {
   el.className = "status" + (kind ? " " + kind : "");
 }
 
+// flashStatus shows a transient message in `elId` and restores the original text+class
+// after 1.6s. Unlike setStatus, this preserves the element's existing className so it
+// can be safely called on banner-styled elements (welcome-perm-warn, etc).
 function flashStatus(elId, text, kind) {
   const el = $(elId);
   if (!el) return;
-  const prev = el.textContent;
-  setStatus(elId, text, kind || "ok");
-  setTimeout(() => { if (el.textContent === text) setStatus(elId, prev); }, 1600);
+  const prevText = el.textContent;
+  const prevClass = el.className;
+  el.textContent = text;
+  if (kind && el.className.indexOf(kind) < 0) el.className = (prevClass + " " + kind).trim();
+  setTimeout(() => {
+    if (el.textContent === text) { el.textContent = prevText; el.className = prevClass; }
+  }, 1600);
 }
 
 function copyText(text) {
@@ -151,6 +160,9 @@ function fallbackCopy(text) {
 // and share it for debugging.
 // ============================================================================
 
+const DIAG_MAX_CHARS = 50000;
+const DIAG_TRIM_TO   = 40000;
+
 function diagLog(direction, payload) {
   const el = document.getElementById("diag-log");
   if (!el) return;
@@ -168,7 +180,10 @@ function diagLog(direction, payload) {
       if (s.length > 800) s = s.slice(0, 800) + "…(truncated)";
     } catch (_e) { s = String(payload); }
   }
-  el.textContent += `[${ts}] ${direction} ${s}\n`;
+  // Cap buffer size — long sessions otherwise leak memory and slow rendering
+  let cur = el.textContent;
+  if (cur.length > DIAG_MAX_CHARS) cur = "…(older entries trimmed)\n" + cur.slice(-DIAG_TRIM_TO);
+  el.textContent = cur + `[${ts}] ${direction} ${s}\n`;
   el.scrollTop = el.scrollHeight;
 }
 
@@ -222,8 +237,12 @@ let pendingState = {
   isLongRunning: false,     // true for megammrsync (post-approval wait required)
 };
 
-function resetPendingState() {
+function clearPendingTimer() {
   if (pendingState.timer) { clearInterval(pendingState.timer); pendingState.timer = null; }
+}
+
+function resetPendingState() {
+  clearPendingTimer();
   pendingState.resolve = null;
   pendingState.reject = null;
   pendingState.uid = null;
@@ -239,11 +258,17 @@ function showPendingBar(label, uid, title) {
   $("pending-bar-cmd").textContent = label;
   $("pending-bar-uid").textContent = "uid " + (uid === "(unknown)" ? "(unknown — use 'I approved it' button)" : uid);
   $("pending-bar-poll").textContent = "…waiting";
+  // The "I approved it" button is meaningful BEFORE approval is recorded.
+  // Once approval is recorded (post-approval wait), hide it so the user can't
+  // accidentally restart the wait clock.
+  $("pending-bar-confirm").hidden = !!pendingState.approvedAt;
   $("pending-bar").hidden = false;
 }
 
 function hidePendingBar() {
   $("pending-bar").hidden = true;
+  // Reset to default visibility so the next pending shows the button again
+  $("pending-bar-confirm").hidden = false;
 }
 
 // Raw MDS.cmd with timeout. Bypasses the cmd() wrapper — used internally for polling.
@@ -347,6 +372,10 @@ async function checkPendingResolution() {
 }
 
 function onPendingApproved() {
+  // IDEMPOTENT — guard against repeated calls (e.g. user clicking "I approved it"
+  // again during the post-approval wait). Without this, approvedAt would reset
+  // and the long-running countdown would restart from zero.
+  if (pendingState.approvedAt) return;
   pendingState.approvedAt = Date.now();
   if (pendingState.isLongRunning) {
     showPendingBar(
@@ -354,8 +383,9 @@ function onPendingApproved() {
       pendingState.uid,
       "Approved — sync running on node (do NOT restart yet)"
     );
-    // The poll timer keeps ticking; checkPendingResolution will finalise after the
-    // post-approval wait elapses.
+    // showPendingBar reads pendingState.approvedAt and hides the manual-approve
+    // button accordingly. The poll timer keeps ticking; checkPendingResolution
+    // will finalise after the post-approval wait elapses.
   } else {
     finalisePendingSuccess();
   }
@@ -383,11 +413,34 @@ function onPendingDismiss() {
     hidePendingBar();
     return;
   }
+  // If the command is long-running and already approved, the megammrsync is
+  // ALREADY RUNNING on the node. Dismissing here makes the dapp think it failed
+  // while the node continues. Warn the user before letting them dismiss.
+  if (pendingState.approvedAt && pendingState.isLongRunning) {
+    if (!confirm(
+      "The sync is already running on the node and will complete on its own. " +
+      "Dismissing here only tells the dapp to treat it as failed — it will not " +
+      "stop the sync. Re-running the recovery while the previous sync is still " +
+      "going can cause conflicts. Dismiss anyway?"
+    )) return;
+  }
   const reject = pendingState.reject;
   diagLog("PENDING-DISMISSED", { uid: pendingState.uid, label: pendingState.label });
   hidePendingBar();
   resetPendingState();
   reject(new PendingDismissedError());
+}
+
+// Read-only commands cannot go pending. Skip the listPendingUids round-trip for these.
+const READ_ONLY_CMDS = new Set([
+  "balance", "getaddress", "scripts", "status", "block", "history", "coins",
+  "checkmode", "checkpending", "tokens", "txnlist", "keys",
+  // sub-action only — these top-level commands have action variants we use as reads only
+  "mds", "network", "maxima",
+]);
+function isReadOnlyCmd(c) {
+  const head = (String(c).trim().split(/\s+/)[0] || "").toLowerCase();
+  return READ_ONLY_CMDS.has(head);
 }
 
 async function cmd(c, opts) {
@@ -396,8 +449,10 @@ async function cmd(c, opts) {
     || (isLongRunningCommand(c) || /^backup /.test(c) ? CMD_TIMEOUT_MS_LONG : CMD_TIMEOUT_MS_DEFAULT);
 
   diagLog("CMD→", maskCommand(c));
-  // Snapshot pending list BEFORE issuing — used to identify our UID afterwards
-  const beforeUids = await listPendingUids();
+  // Snapshot pending list BEFORE issuing — used to identify our UID afterwards.
+  // Skip for read-only commands: they can't pend, and the round-trip would slow
+  // down every read with an extra MDS call.
+  const beforeUids = isReadOnlyCmd(c) ? [] : await listPendingUids();
 
   let r;
   try {
@@ -992,6 +1047,16 @@ async function onSweep() {
 }
 
 function onSweepNext() {
+  // If any token failed to send, warn before proceeding — funds remain at the
+  // compromised wallet for any failed token and won't be recovered.
+  const results = $("sweep-results");
+  const failedRows = results ? results.querySelectorAll(".sweep-result.err").length : 0;
+  if (failedRows > 0) {
+    if (!confirm(
+      failedRows + " token(s) failed to send and remain at the compromised address. " +
+      "Continuing to restore now will leave them stranded. Continue anyway?"
+    )) return;
+  }
   show("restore");
   enterRestoreStep();
 }
@@ -1205,13 +1270,18 @@ async function mmDownload() {
   $("mm-download-btn").disabled = true;
   try {
     diagLog("FILE.download→", { url: MEGAMMR_FILE_URL });
-    const res = await new Promise((resolve, reject) => {
-      MDS.file.download(MEGAMMR_FILE_URL, function (res) {
-        diagLog("FILE.download←", res);
-        if (res && res.status) resolve(res);
-        else reject(new Error((res && res.error) || "download failed"));
-      });
-    });
+    // Race the download against a 5-minute timeout — without it, an unreachable
+    // URL or a stalled download where the callback never fires hangs the dapp.
+    const res = await Promise.race([
+      new Promise((resolve, reject) => {
+        MDS.file.download(MEGAMMR_FILE_URL, function (res) {
+          diagLog("FILE.download←", res);
+          if (res && res.status) resolve(res);
+          else reject(new Error((res && res.error) || "download failed"));
+        });
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("download timeout (5 minutes)")), 300000)),
+    ]);
     // Capture any path the download response gave us — saves a getpath call
     const r = res.response || {};
     if (r.file || r.path || r.fullpath) {
