@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AnyPhraseRecovery</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <script type="text/javascript" src="mds.js"></script>
+</head>
+<body>
+  <header>
+    <h1>AnyPhraseRecovery</h1>
+    <p class="sub">Sweep funds out of a compromised webWallet seed without giving up control of this Minima node.</p>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="recover">Recover funds</button>
+    <button class="tab" data-tab="megammr">Become a MegaMMR host</button>
+  </nav>
+
+  <main>
+
+    <!-- ============================ TAB 1: RECOVER ============================ -->
+    <section id="tab-recover" class="tab-panel active">
+
+      <!-- ===== Step 0 — welcome ===== -->
+      <div id="step-welcome" class="step active">
+        <div class="card">
+          <h2>What this dapp does</h2>
+          <ol class="explainer-numbered">
+            <li><strong>Snapshot</strong> this Minima node (full backup, encrypted with a random password).</li>
+            <li><strong>Borrow</strong> the compromised seed: import it into this node via a public MegaMMR sync.</li>
+            <li><strong>Sweep</strong> all recovered balances back to <em>this node's own existing address</em>.</li>
+            <li><strong>Restore</strong> this node from the snapshot — your original seed and wallet are back exactly as they were.</li>
+          </ol>
+          <div class="banner ok">
+            <strong>Net effect:</strong> the recovered funds end up in this node's normal wallet. The compromised seed never leaves this device. This node's identity is borrowed for ~5 minutes and then put back.
+          </div>
+          <div class="banner warn">
+            <strong>Two restarts required.</strong> The flow needs you to restart Minima twice (once after import, once after restore). The dapp remembers where you were and picks up automatically when you come back.
+          </div>
+          <div class="actions row">
+            <button id="welcome-start-btn" class="btn primary">Get started</button>
+          </div>
+          <details class="advanced">
+            <summary>Resuming an in-progress recovery? Or want to abandon and clean up?</summary>
+            <p class="hint">If you've started a recovery already, this dapp normally picks up where you left off. Click the button below to wipe the saved state if something is stuck.</p>
+            <div class="actions row">
+              <button id="welcome-clear-btn" class="btn">Clear saved state and start fresh</button>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <!-- ===== Step 1 — snapshot ===== -->
+      <div id="step-snapshot" class="step">
+        <div class="card">
+          <div class="step-indicator">Step 1 of 5 — Snapshot this node</div>
+          <h2>Two pieces of paper insurance</h2>
+          <p class="hint">Both of these protect your existing wallet. If anything in the recovery goes wrong, either one alone is enough to put your node back to normal.</p>
+
+          <h3>1A · Your node's current seed phrase</h3>
+          <div class="banner danger">
+            <strong>Write these words on PAPER. Not on this device.</strong>
+            This is the seed of <em>your</em> wallet. The dapp will temporarily replace it during recovery, then put it back. If the put-back fails, this paper is how you recover.
+          </div>
+          <div class="field-block">
+            <div class="field-label">A sample address from this node (Mx)</div>
+            <div id="snap-mx" class="value-block mono mx">…</div>
+          </div>
+          <div class="field-block">
+            <div class="field-label">This node's seed</div>
+            <div id="snap-seed" class="seed-grid">…</div>
+          </div>
+          <div class="actions row">
+            <button id="snap-copyseed-btn" class="btn">Copy seed</button>
+            <button id="snap-copymx-btn" class="btn">Copy address</button>
+          </div>
+
+          <h3>1B · Prove you wrote it down</h3>
+          <p class="hint">Type the requested words from your paper to confirm.</p>
+          <div id="snap-verify-prompts" class="verify-grid"></div>
+          <label class="check-row">
+            <input type="checkbox" id="snap-paper-check" />
+            <span>I have written down all the words on paper, NOT stored on this device.</span>
+          </label>
+
+          <h3>1C · Encrypted backup file (the fast restore path)</h3>
+          <p class="hint">When you click below, the dapp will run <code>backup</code> on this node. The .bak file gets a randomly-generated password.</p>
+          <div class="actions row">
+            <button id="snap-backup-btn" class="btn primary" disabled>Run backup</button>
+          </div>
+          <p id="snap-backup-status" class="status"></p>
+          <div id="snap-backup-info" hidden>
+            <div class="field-block">
+              <div class="field-label">Backup file (full path)</div>
+              <div id="snap-backup-file" class="value-block mono">…</div>
+            </div>
+            <div class="field-block">
+              <div class="field-label">Backup password — write it down</div>
+              <div id="snap-backup-password" class="value-block mono pw">…</div>
+            </div>
+            <div class="actions row">
+              <button id="snap-copypw-btn" class="btn">Copy password</button>
+            </div>
+            <div class="banner danger">
+              <strong>Write this password on the SAME piece of paper as your seed.</strong>
+              The .bak file is encrypted — without the password it's useless.
+            </div>
+            <label class="check-row">
+              <input type="checkbox" id="snap-pw-check" />
+              <span>I have written the backup password down on paper.</span>
+            </label>
+          </div>
+
+          <div class="actions row">
+            <button id="snap-back-btn" class="btn">Back</button>
+            <button id="snap-continue-btn" class="btn primary" disabled>Continue</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Step 2 — paste compromised seed ===== -->
+      <div id="step-seed" class="step">
+        <div class="card">
+          <div class="step-indicator">Step 2 of 5 — Paste the compromised seed</div>
+          <h2>Compromised webWallet seed</h2>
+          <div class="banner warn">
+            <strong>This seed is being treated as compromised.</strong>
+            The recovery sweep will move every coin off it. After today, never type this seed into anything ever again.
+          </div>
+          <p class="hint">Whatever you originally typed into the web wallet — exactly as you typed it. Webwallet seeds can be 24 BIP-39 words, or any custom string (e.g. a passphrase you made up). Case and spaces matter.</p>
+          <textarea id="seed-input"
+                    placeholder="enter your webWallet seed exactly as you typed it"
+                    spellcheck="false"
+                    autocomplete="off"
+                    autocapitalize="none"
+                    autocorrect="off"></textarea>
+          <div class="actions row">
+            <button id="seed-back-btn" class="btn">Back</button>
+            <button id="seed-continue-btn" class="btn primary">Continue</button>
+          </div>
+          <p id="seed-status" class="status"></p>
+        </div>
+      </div>
+
+      <!-- ===== Step 3 — pick host + run megammrsync ===== -->
+      <div id="step-sync" class="step">
+        <div class="card">
+          <div class="step-indicator">Step 3 of 5 — Sync the compromised wallet onto this node</div>
+          <h2>MegaMMR host</h2>
+          <p class="hint">A MegaMMR host has the recent chain state. The dapp picks one at random:</p>
+          <ul id="host-list" class="host-list"></ul>
+          <div class="field-block">
+            <div class="field-label">Selected host</div>
+            <div id="selected-host" class="value-block mono">…</div>
+          </div>
+
+          <div class="actions row">
+            <button id="rotate-host-btn" class="btn">Try a different host</button>
+            <button id="sync-back-btn" class="btn">Back</button>
+            <button id="sync-run-btn" class="btn primary">Run megammrsync</button>
+          </div>
+
+          <details class="advanced">
+            <summary>Advanced — use a custom host</summary>
+            <p class="hint warn">Only use a host you trust. A malicious host can refuse to sync but cannot steal your funds (the seed never leaves this device — but the host learns which addresses you're recovering).</p>
+            <input id="custom-host-input" class="text-input mono" placeholder="host:9001" spellcheck="false" autocomplete="off" />
+            <button id="custom-host-set-btn" class="btn">Use this host</button>
+          </details>
+
+          <p id="sync-status" class="status"></p>
+          <pre id="sync-log" class="log"></pre>
+        </div>
+      </div>
+
+      <!-- ===== REBOOT 1 ===== -->
+      <div id="step-reboot1" class="step">
+        <div class="card reboot-card">
+          <div class="step-indicator">Restart required</div>
+          <h2>Restart your Minima node now</h2>
+          <p>The compromised wallet has been imported onto this node. The Minima node needs a restart before we can read its balance.</p>
+
+          <div class="reboot-instructions reboot-android" hidden>
+            <ol>
+              <li>Open your phone's app switcher.</li>
+              <li>Swipe Minima away to fully close it.</li>
+              <li>Tap the Minima icon on your home screen to reopen it.</li>
+              <li>Open MiniHub → tap <strong>AnyPhraseRecovery</strong> to come back here.</li>
+            </ol>
+          </div>
+          <div class="reboot-instructions reboot-desktop" hidden>
+            <ol>
+              <li>Stop your Minima node (<code>Ctrl+C</code> in the terminal running <code>java -jar minima.jar</code>).</li>
+              <li>Re-launch with the same arguments.</li>
+              <li>Reopen this dapp from MiniHub.</li>
+            </ol>
+          </div>
+
+          <div class="banner ok">
+            <strong>The dapp will pick up where it left off.</strong>
+            We've saved everything we need (backup file, password, destination, host) in this dapp's local storage. When the node is back up and you reopen this dapp, you'll land directly on the sweep screen.
+          </div>
+
+          <details class="advanced">
+            <summary>Saved state details</summary>
+            <pre id="reboot1-state" class="log small"></pre>
+          </details>
+        </div>
+      </div>
+
+      <!-- ===== Step 4 — sweep ===== -->
+      <div id="step-sweep" class="step">
+        <div class="card">
+          <div class="step-indicator">Step 4 of 5 — Send recovered funds to your address</div>
+          <h2>Recovered balance</h2>
+
+          <p id="sweep-loading-status" class="status">Loading balance from the imported wallet…</p>
+
+          <div class="field-block">
+            <div class="field-label">Sending to (your wallet's address)</div>
+            <div id="sweep-dest" class="value-block mono mx">…</div>
+          </div>
+
+          <div class="field-block">
+            <div class="field-label">Found</div>
+            <div id="sweep-balance" class="balance-list">…</div>
+          </div>
+
+          <div id="sweep-empty-warn" class="banner warn" hidden>
+            <strong>No spendable balance found at the imported wallet.</strong>
+            The seed may already be drained, you may have entered the wrong seed, or the megammr host may not have indexed the relevant addresses. Either retry recovery with a different host, or skip ahead to restore your wallet.
+            <div class="actions row">
+              <button id="sweep-skip-restore-btn" class="btn">Skip to restore</button>
+            </div>
+          </div>
+
+          <div id="sweep-dest-warn" class="banner danger" hidden>
+            <strong>Destination overlap detected.</strong>
+            The destination matches an address from the imported (compromised) seed. That should not happen with the default flow — please report.
+          </div>
+
+          <div id="sweep-confirm-block" hidden>
+            <label class="check-row">
+              <input type="checkbox" id="confirm-verified" />
+              <span>I have verified the destination address above is the same as the one shown in step 1.</span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="confirm-final" />
+              <span>I understand this transaction is final.</span>
+            </label>
+
+            <details class="advanced">
+              <summary>Advanced — sweep to a different address instead</summary>
+              <p class="hint warn">Default is to sweep back to your wallet's own address. Only override this if you have a specific other Mx you control.</p>
+              <input id="custom-dest-input" class="text-input mono" placeholder="Mx…" spellcheck="false" autocomplete="off" autocapitalize="none" autocorrect="off" />
+              <div class="actions row">
+                <button id="custom-dest-set-btn" class="btn">Use this destination</button>
+                <button id="custom-dest-clear-btn" class="btn">Reset to your wallet's address</button>
+              </div>
+              <label class="check-row" id="custom-dest-confirm-row" hidden>
+                <input type="checkbox" id="confirm-custom-dest" />
+                <span>I confirm I control the destination address above and have its seed backed up.</span>
+              </label>
+            </details>
+
+            <div class="actions row">
+              <button id="sweep-go-btn" class="btn primary danger" disabled>Send everything to destination</button>
+            </div>
+          </div>
+
+          <p id="sweep-status" class="status"></p>
+          <div id="sweep-results" class="sweep-results"></div>
+
+          <div class="actions row" id="sweep-next-row" hidden>
+            <button id="sweep-next-btn" class="btn primary">Continue to restore</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Step 5 — restore ===== -->
+      <div id="step-restore" class="step">
+        <div class="card">
+          <div class="step-indicator">Step 5 of 5 — Restore your wallet</div>
+          <h2>Put your wallet back</h2>
+          <p class="hint">This runs <code>megammrsync action:resync</code> with the snapshot you took in step 1 as input. After it finishes, this node's seed and wallet will be exactly as they were before recovery began.</p>
+
+          <p id="restore-wait-status" class="status warn"></p>
+
+          <div class="actions row">
+            <button id="restore-run-btn" class="btn primary" disabled>Restore from snapshot</button>
+          </div>
+          <p id="restore-status" class="status"></p>
+          <pre id="restore-log" class="log"></pre>
+        </div>
+      </div>
+
+      <!-- ===== REBOOT 2 ===== -->
+      <div id="step-reboot2" class="step">
+        <div class="card reboot-card">
+          <div class="step-indicator">Restart required (final)</div>
+          <h2>Restart your Minima node one more time</h2>
+          <p>The snapshot has been loaded. The node needs one more restart for your original wallet to come back online.</p>
+
+          <div class="reboot-instructions reboot-android" hidden>
+            <ol>
+              <li>Open your phone's app switcher.</li>
+              <li>Swipe Minima away.</li>
+              <li>Tap the Minima icon on your home screen to reopen.</li>
+              <li>Open MiniHub → tap <strong>AnyPhraseRecovery</strong>. Verification runs automatically.</li>
+            </ol>
+          </div>
+          <div class="reboot-instructions reboot-desktop" hidden>
+            <ol>
+              <li>Stop your Minima node.</li>
+              <li>Re-launch with the same arguments.</li>
+              <li>Reopen this dapp. Verification runs automatically.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Step 6 — verify + done ===== -->
+      <div id="step-verify" class="step">
+        <div class="card">
+          <div class="step-indicator">Verification</div>
+          <h2>Checking that your wallet is back</h2>
+          <p id="verify-status" class="status"></p>
+          <div id="verify-results" class="verify-results"></div>
+
+          <div id="verify-success" class="banner ok" hidden>
+            <strong>Recovery complete.</strong>
+            Your wallet is back. The recovered funds are at the address you swept to.
+          </div>
+
+          <div id="verify-failure" class="banner danger" hidden>
+            <strong>Verification failed.</strong>
+            Don't panic — your funds are safe on chain. Manual recovery options:
+            <ol class="next-steps">
+              <li>Run from the terminal: <code id="verify-failure-cmd">megammrsync action:resync host:&lt;host&gt; file:&lt;backup&gt; password:&lt;password&gt;</code> (the values are in this dapp's saved state — see "Saved state" below). Then restart your node.</li>
+              <li>If that fails, reinstall Minima fresh and run <code>vault action:restorekeys phrase:"&lt;your original seed&gt;"</code> with the seed you wrote on paper in step 1. Then restart.</li>
+              <li>Either way, your recovered funds are at the destination Mx you swept to and will be spendable as soon as the wallet is restored.</li>
+            </ol>
+            <details class="advanced">
+              <summary>Saved state</summary>
+              <pre id="verify-failure-state" class="log small"></pre>
+            </details>
+          </div>
+
+          <div class="actions row">
+            <button id="finish-restart-btn" class="btn">Start over (clears saved state)</button>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ============================ TAB 2: MEGAMMR ============================ -->
+    <section id="tab-megammr" class="tab-panel">
+      <div class="card">
+        <h2>Run a MegaMMR host on this node</h2>
+        <p class="hint">Help other recovery dapp users by hosting a MegaMMR. Three steps.</p>
+
+        <div class="megammr-step">
+          <div class="step-indicator">Step 1 — Add the <code>-megammr</code> startup flag</div>
+          <p>Stop your Minima node, then re-launch with <code>-megammr</code> in the startup arguments. Come back here once it's running.</p>
+          <div class="actions row">
+            <button id="mm-detect-btn" class="btn">Detect status</button>
+          </div>
+          <p id="mm-detect-status" class="status"></p>
+        </div>
+
+        <div class="megammr-step">
+          <div class="step-indicator">Step 2 — Download the MegaMMR seed file</div>
+          <p>This pulls <code>https://eurobuddha.com/mega.mmr</code> down to this node. May be large — give it a minute.</p>
+          <div class="actions row">
+            <button id="mm-download-btn" class="btn primary" disabled>Download mega.mmr</button>
+          </div>
+          <p id="mm-download-status" class="status"></p>
+        </div>
+
+        <div class="megammr-step">
+          <div class="step-indicator">Step 3 — Import it</div>
+          <p>Loads the file into your local MegaMMR.</p>
+          <div class="actions row">
+            <button id="mm-import-btn" class="btn primary" disabled>Import mega.mmr</button>
+          </div>
+          <p id="mm-import-status" class="status"></p>
+        </div>
+
+        <div class="megammr-step">
+          <div class="step-indicator">Optional — Share your node so others can sync from it</div>
+          <p class="hint">Copy this and DM it to <strong>eurobuddha</strong> on Discord/Telegram so we can add it to the host pool.</p>
+          <div class="field-block">
+            <div class="field-label">Network info</div>
+            <pre id="mm-netinfo" class="log small">click "Refresh" to populate</pre>
+          </div>
+          <div class="actions row">
+            <button id="mm-netinfo-btn" class="btn">Refresh</button>
+            <button id="mm-netinfo-copy-btn" class="btn">Copy</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

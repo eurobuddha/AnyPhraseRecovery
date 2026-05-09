@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Sensitive — backup files, password files, anything that might leak a seed
+*.bak
+*_password*
+*_seed*
+*.private
+seed.txt
+password.txt
+
+# Build / temp
+node_modules/
+*.log
+.tmp/
+
+# Editor
+.vscode/
+.idea/
+*.swp
