@@ -14,22 +14,24 @@
     <p class="sub">Sweep funds out of a compromised webWallet seed without giving up control of this Minima node.</p>
   </header>
 
-  <!-- Sticky pending banner — fixed to top, always visible while a command is queued.
-       Stays up until either (a) the UID disappears from the pending list, (b) the user
-       clicks "I approved it", or (c) the user dismisses (which rejects the awaiting cmd). -->
+  <!-- Sticky pending banner — fixed to top of viewport, always visible while a command
+       is queued. Message is intentionally simple: this dapp can NOT itself approve;
+       the user must leave, approve in MiniHub, then return. We auto-detect on return. -->
   <div id="pending-bar" class="pending-bar" hidden>
     <div class="pending-bar-inner">
       <div class="pending-bar-spinner">⏳</div>
       <div class="pending-bar-text">
-        <div class="pending-bar-title" id="pending-bar-title">Approve in MiniHub Pending</div>
-        <div class="pending-bar-detail">
-          <span id="pending-bar-cmd">command</span>
-          <span class="pending-bar-uid" id="pending-bar-uid">—</span>
+        <div class="pending-bar-title" id="pending-bar-title">This action needs pending approval</div>
+        <div class="pending-bar-step">
+          1. Open <strong>MiniHub</strong> &rarr; <strong>Pending</strong>
+          &nbsp;&nbsp;2. Tap <strong>Accept</strong> on <span id="pending-bar-cmd">command</span>
+          &nbsp;&nbsp;3. Come back &mdash; this dapp will continue automatically
         </div>
-        <div class="pending-bar-poll" id="pending-bar-poll">…polling for approval</div>
+        <div class="pending-bar-poll" id="pending-bar-poll">…waiting</div>
+        <div class="pending-bar-uid" id="pending-bar-uid">—</div>
       </div>
       <div class="pending-bar-buttons">
-        <button id="pending-bar-confirm" class="pending-bar-confirm" title="If you've already approved in MiniHub, click here">I approved it</button>
+        <button id="pending-bar-confirm" class="pending-bar-confirm" title="Use this only if auto-detection fails after you've approved in MiniHub">I've already approved it</button>
         <button id="pending-bar-dismiss" class="pending-bar-dismiss" title="Cancel — the dapp will treat the command as failed">×</button>
       </div>
     </div>

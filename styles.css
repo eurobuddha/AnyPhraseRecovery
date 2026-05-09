@@ -561,20 +561,22 @@ ol.explainer-numbered strong { color: var(--accent); }
   font-size: 15px;
   letter-spacing: 0.3px;
 }
-.pending-bar-detail {
-  font-family: var(--mono);
-  font-size: 12px;
-  margin-top: 2px;
-  opacity: 0.75;
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
+.pending-bar-step {
+  font-size: 13px;
+  margin-top: 4px;
+  line-height: 1.5;
+  font-weight: 500;
 }
+.pending-bar-step strong { font-weight: 700; }
 .pending-bar-uid {
+  font-family: var(--mono);
+  font-size: 10px;
+  margin-top: 4px;
+  opacity: 0.55;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
+  max-width: 100%;
 }
 .pending-bar-poll {
   font-size: 11px;

@@ -30,6 +30,9 @@ const MEGAMMR_LOCAL_FILENAME = "mega.mmr";
 //
 // state.stage values used as persisted resume points:
 //   null / undefined        — no flow in progress; show welcome
+//   "snapshot_done"         — backup completed (locally or via approved pending);
+//                             credentials persisted. On resume: jump to seed step
+//                             with the backup info preserved (do NOT show welcome).
 //   "import_sync_pending"   — megammrsync(import) just issued; node will reboot.
 //                             On resume: load balance, show sweep step.
 //   "swept"                 — sweep complete; ready to issue restore megammrsync.
@@ -49,6 +52,13 @@ const state = {
 
   // PERSISTED — remembers when the post-sweep cooldown finishes so revisits skip the wait
   restoreReadyAt: null,
+
+  // PERSISTED — in-flight pending action. Used to seamlessly re-attach the pending
+  // banner after the user closes the dapp to approve in MiniHub and returns.
+  pendingUid: null,             // lowercase hex
+  pendingLabel: null,           // short display label
+  pendingIsLongRunning: false,
+  pendingApprovedAt: null,      // ms epoch when approval was detected (null = pre-approval)
 
   // EPHEMERAL (per-session) — these are rebuilt on resume by the relevant enter*Step()
   compromisedSeed: null,        // only used to issue megammrsync, never persisted
@@ -72,6 +82,10 @@ function savePersisted() {
       destinationMx: state.destinationMx,
       hostFingerprint: state.hostFingerprint,
       restoreReadyAt: state.restoreReadyAt,
+      pendingUid: state.pendingUid,
+      pendingLabel: state.pendingLabel,
+      pendingIsLongRunning: state.pendingIsLongRunning,
+      pendingApprovedAt: state.pendingApprovedAt,
     }));
   } catch (_e) { /* localStorage may be unavailable; flow degrades but won't crash */ }
 }
@@ -94,7 +108,32 @@ function clearPersisted() {
   state.destinationMx = null;
   state.hostFingerprint = null;
   state.restoreReadyAt = null;
+  state.pendingUid = null;
+  state.pendingLabel = null;
+  state.pendingIsLongRunning = false;
+  state.pendingApprovedAt = null;
   state.megammrDownloadPath = null;
+}
+
+// Persisted pending bookkeeping — set immediately when entering pending so a dapp
+// reload (e.g. after user goes to MiniHub and returns) can re-attach the banner.
+function setPendingPersisted(uid, label, longRunning) {
+  state.pendingUid = uid;
+  state.pendingLabel = label;
+  state.pendingIsLongRunning = !!longRunning;
+  state.pendingApprovedAt = null;
+  savePersisted();
+}
+function markPendingApprovedPersisted() {
+  state.pendingApprovedAt = Date.now();
+  savePersisted();
+}
+function clearPendingPersisted() {
+  state.pendingUid = null;
+  state.pendingLabel = null;
+  state.pendingIsLongRunning = false;
+  state.pendingApprovedAt = null;
+  savePersisted();
 }
 
 function persistedAsString() {
@@ -280,18 +319,32 @@ function rawCmd(c, timeoutMs) {
   ]);
 }
 
-async function listPendingUids() {
+// Check whether a SPECIFIC pending UID is still in the queue. Uses the dedicated
+// `checkpending` command, which is a true read and does NOT itself queue another
+// pending entry (unlike `mds action:pending`, which the MDS bridge treats as a
+// write because the `mds` namespace also contains accept/deny/install/uninstall).
+//
+// Returns: true if still pending, false if no longer pending (approved or denied),
+// null if we can't tell (network error, unexpected response shape).
+async function isUidStillPending(uid) {
+  if (!uid || uid === "(unknown)") return null;
   try {
-    const r = await rawCmd("mds action:pending", 8000);
-    if (!r) return [];
+    const r = await rawCmd("checkpending uid:" + uid, 8000);
+    if (!r || !r.status) return null;
     const resp = r.response || {};
-    // MDS may return the pending list as response.pending OR as response itself
-    let arr = resp.pending || resp.list || (Array.isArray(resp) ? resp : null);
-    if (!Array.isArray(arr)) return [];
-    return arr
-      .map(p => p && String(p.uid || p.id || p || "").toLowerCase())
-      .filter(Boolean);
-  } catch (_e) { return []; }
+    // checkpending response shape (best-effort; tolerate variants):
+    //   { pending: true|false }
+    //   { found: true|false }
+    //   { exists: true|false }
+    //   "true" / "false" string
+    if (typeof resp === "string") return /true|yes|1/i.test(resp);
+    if (typeof resp.pending === "boolean") return resp.pending;
+    if (typeof resp.found   === "boolean") return resp.found;
+    if (typeof resp.exists  === "boolean") return resp.exists;
+    // Unknown shape — log it for diagnosis and bail
+    diagLog("checkpending unknown shape", resp);
+    return null;
+  } catch (_e) { return null; }
 }
 
 function isPendingResponse(r) {
@@ -320,8 +373,12 @@ function isLongRunningCommand(c) {
 function waitForPendingResolution(commandStr, uid) {
   const label = (commandStr.split(" ")[0] || commandStr).slice(0, 32);
   const longRunning = isLongRunningCommand(commandStr);
-  showPendingBar(label, uid, "Approve in MiniHub Pending");
+  showPendingBar(label, uid, "This action needs pending approval");
   diagLog("PENDING", { command: label, uid: uid, longRunning: longRunning });
+
+  // Persist immediately so a dapp reload (user goes to MiniHub and returns) can
+  // re-attach to this pending and resume polling.
+  setPendingPersisted((uid || "").toLowerCase(), label, longRunning);
 
   return new Promise((resolve, reject) => {
     pendingState.resolve = resolve;
@@ -359,16 +416,17 @@ async function checkPendingResolution() {
 
   $("pending-bar-poll").textContent =
     pendingState.uid === "(unknown)"
-      ? "waiting for you to click 'I approved it' (UID couldn't be auto-detected)"
-      : "polling for approval (" + elapsed + "s elapsed)";
+      ? "waiting for you to tap 'I've already approved it' once you've approved in MiniHub"
+      : "checking every 2s — last check " + elapsed + "s ago";
 
   if (pendingState.uid === "(unknown)") return;  // can't auto-detect; wait for manual button
 
-  const uids = await listPendingUids();
-  if (!uids.includes(pendingState.uid)) {
-    // UID gone — approval (or denial) happened
+  const stillPending = await isUidStillPending(pendingState.uid);
+  if (stillPending === false) {
+    // UID is no longer in the pending list — approval (or denial) happened
     onPendingApproved();
   }
+  // null = couldn't tell; just keep polling
 }
 
 function onPendingApproved() {
@@ -377,6 +435,7 @@ function onPendingApproved() {
   // and the long-running countdown would restart from zero.
   if (pendingState.approvedAt) return;
   pendingState.approvedAt = Date.now();
+  markPendingApprovedPersisted();
   if (pendingState.isLongRunning) {
     showPendingBar(
       pendingState.label,
@@ -397,6 +456,7 @@ function finalisePendingSuccess() {
   diagLog("PENDING-RESOLVED", { uid: pendingState.uid, label: pendingState.label });
   hidePendingBar();
   resetPendingState();
+  clearPendingPersisted();
   resolve({ status: true, response: { pendingResolved: true } });
 }
 
@@ -428,19 +488,8 @@ function onPendingDismiss() {
   diagLog("PENDING-DISMISSED", { uid: pendingState.uid, label: pendingState.label });
   hidePendingBar();
   resetPendingState();
+  clearPendingPersisted();
   reject(new PendingDismissedError());
-}
-
-// Read-only commands cannot go pending. Skip the listPendingUids round-trip for these.
-const READ_ONLY_CMDS = new Set([
-  "balance", "getaddress", "scripts", "status", "block", "history", "coins",
-  "checkmode", "checkpending", "tokens", "txnlist", "keys",
-  // sub-action only — these top-level commands have action variants we use as reads only
-  "mds", "network", "maxima",
-]);
-function isReadOnlyCmd(c) {
-  const head = (String(c).trim().split(/\s+/)[0] || "").toLowerCase();
-  return READ_ONLY_CMDS.has(head);
 }
 
 async function cmd(c, opts) {
@@ -449,10 +498,13 @@ async function cmd(c, opts) {
     || (isLongRunningCommand(c) || /^backup /.test(c) ? CMD_TIMEOUT_MS_LONG : CMD_TIMEOUT_MS_DEFAULT);
 
   diagLog("CMD→", maskCommand(c));
-  // Snapshot pending list BEFORE issuing — used to identify our UID afterwards.
-  // Skip for read-only commands: they can't pend, and the round-trip would slow
-  // down every read with an extra MDS call.
-  const beforeUids = isReadOnlyCmd(c) ? [] : await listPendingUids();
+  // NOTE: we do NOT pre-snapshot the pending list here. Listing pending via
+  // `mds action:pending` itself queues a new pending entry in READ mode (because
+  // the `mds` namespace contains accept/deny/install actions, so MDS treats every
+  // call to it as write-protected). That caused a cascade: a single backup
+  // request created 6+ pending entries. Instead we rely on extractPendingUid()
+  // (which works for response.uid / response.pending="0xUID" / error-string with
+  // 0x...) and fall back to the manual "I've already approved it" button.
 
   let r;
   try {
@@ -464,14 +516,7 @@ async function cmd(c, opts) {
   diagLog("RES←", r);
 
   if (isPendingResponse(r)) {
-    let uid = extractPendingUid(r);
-    if (uid === "(unknown)") {
-      // Try the diff of pending lists
-      const afterUids = await listPendingUids();
-      const newUids = afterUids.filter(u => !beforeUids.includes(u));
-      if (newUids.length === 1) uid = newUids[0];
-      else if (newUids.length > 1) uid = newUids[newUids.length - 1];
-    }
+    const uid = extractPendingUid(r);
     return await waitForPendingResolution(c, uid);
   }
 
@@ -738,8 +783,10 @@ async function onSnapBackup() {
     const absolutePath = (((r.response || {}).backup) || {}).file || file;
     state.backupFile = absolutePath;
     $("snap-backup-file").textContent = absolutePath;
-    // CRITICAL: persist NOW so the user can close+reopen the dapp without losing the
-    // backup credentials they just wrote down.
+    // Mark stage as snapshot_done so a dapp close + reopen resumes here (and not
+    // back at the welcome screen). CRITICAL — without this, the user loses all
+    // their backup credentials on any reload.
+    state.stage = "snapshot_done";
     savePersisted();
     setStatus("snap-backup-status", "Backup complete. Write the password down before continuing.", "ok");
     updateSnapshotEnabled();
@@ -1458,6 +1505,37 @@ function wireUp() {
       flashStatus("mm-detect-status", ok ? "Copied." : "Copy failed.")));
 }
 
+// Re-attach the pending banner if a pending action was in-flight when the dapp
+// was last closed (e.g. user went to MiniHub to approve and is now back). Resumes
+// polling and resolves the (newly created) Promise when approval is detected.
+function reattachPendingFromPersisted() {
+  if (!state.pendingUid) return null;
+  const uid = state.pendingUid;
+  const label = state.pendingLabel || "(unknown)";
+  const longRunning = !!state.pendingIsLongRunning;
+  const wasApproved = state.pendingApprovedAt;
+  diagLog("PENDING-REATTACH", { uid: uid, label: label, longRunning: longRunning, approvedAt: wasApproved });
+
+  showPendingBar(label, uid, wasApproved
+    ? "Approved — sync running on node (do NOT restart yet)"
+    : "This action needs pending approval");
+
+  return new Promise((resolve, reject) => {
+    pendingState.resolve = resolve;
+    pendingState.reject = reject;
+    pendingState.uid = uid;
+    pendingState.command = label;
+    pendingState.label = label;
+    pendingState.startedAt = Date.now();
+    pendingState.approvedAt = wasApproved || null;
+    pendingState.isLongRunning = longRunning;
+
+    if (pendingState.timer) clearInterval(pendingState.timer);
+    pendingState.timer = setInterval(checkPendingResolution, 2000);
+    checkPendingResolution();
+  });
+}
+
 function resumeFromPersisted() {
   const p = loadPersisted();
   if (!p || !p.stage) {
@@ -1465,21 +1543,39 @@ function resumeFromPersisted() {
     return;
   }
   Object.assign(state, p);
-  diagLog("RESUME", { stage: p.stage });
+  diagLog("RESUME", { stage: p.stage, hasPending: !!p.pendingUid });
   switch (p.stage) {
+    case "snapshot_done":
+      // User did the backup, possibly closed the dapp to approve it in MiniHub
+      // Pending, and is now back. Re-attach the pending banner if needed; otherwise
+      // jump to the seed-paste step with backup credentials preserved.
+      show("snapshot");
+      // Re-render the snapshot info from persisted state
+      $("snap-backup-info").hidden = false;
+      $("snap-backup-file").textContent = state.backupFile || "(missing)";
+      $("snap-backup-password").textContent = state.backupPassword || "(missing)";
+      $("snap-pw-check").checked = true;     // user already confirmed, don't re-gate
+      $("snap-continue-btn").disabled = false;
+      setStatus("snap-backup-status",
+        "Welcome back — backup is recorded. Continue when ready.", "ok");
+      reattachPendingFromPersisted();         // no-op if no pending was in flight
+      break;
     case "import_sync_pending":
       // node has been rebooted (else MDS wouldn't be inited). Resume to sweep.
+      reattachPendingFromPersisted();
       enterSweepStep();
       break;
     case "swept":
       // user closed dapp before triggering restore; resume to restore step
       show("restore");
       setStatus("restore-status", "Welcome back — your sweep is recorded. Restore is the next step.", "ok");
+      reattachPendingFromPersisted();
       enterRestoreStep();
       break;
     case "restore_sync_pending":
       show("verify");
       setStatus("verify-status", "Welcome back — verifying the restore…", "ok");
+      reattachPendingFromPersisted();
       enterVerifyStep();
       break;
     case "verified":
