@@ -1,4 +1,4 @@
-// AnyPhraseRecovery v0.4.4 — sweep funds out of a compromised webWallet seed and restore
+// AnyPhraseRecovery v0.4.6 — sweep funds out of a compromised webWallet seed and restore
 // the host node back to its original state.
 //
 // The flow REQUIRES two node restarts (after each megammrsync). State is persisted to
@@ -59,6 +59,12 @@ const state = {
   pendingLabel: null,           // short display label
   pendingIsLongRunning: false,
   pendingApprovedAt: null,      // ms epoch when approval was detected (null = pre-approval)
+  pendingStartedAt: null,       // ms epoch when banner first went up (preserved across reload)
+
+  // PERSISTED — per-token sweep progress. Lets us resume a multi-token sweep without
+  // re-sending tokens that already went out. Each entry: {tokenid, sendable, name, status}
+  // status ∈ { "pending" | "sent" | "failed" }
+  sweepProgress: null,          // null = no sweep started; [] = sweep started, no entries yet
 
   // EPHEMERAL (per-session) — these are rebuilt on resume by the relevant enter*Step()
   compromisedSeed: null,        // only used to issue megammrsync, never persisted
@@ -86,6 +92,8 @@ function savePersisted() {
       pendingLabel: state.pendingLabel,
       pendingIsLongRunning: state.pendingIsLongRunning,
       pendingApprovedAt: state.pendingApprovedAt,
+      pendingStartedAt: state.pendingStartedAt,
+      sweepProgress: state.sweepProgress,
     }));
   } catch (_e) { /* localStorage may be unavailable; flow degrades but won't crash */ }
 }
@@ -112,6 +120,8 @@ function clearPersisted() {
   state.pendingLabel = null;
   state.pendingIsLongRunning = false;
   state.pendingApprovedAt = null;
+  state.pendingStartedAt = null;
+  state.sweepProgress = null;
   state.megammrDownloadPath = null;
 }
 
@@ -122,6 +132,7 @@ function setPendingPersisted(uid, label, longRunning) {
   state.pendingLabel = label;
   state.pendingIsLongRunning = !!longRunning;
   state.pendingApprovedAt = null;
+  state.pendingStartedAt = Date.now();
   savePersisted();
 }
 function markPendingApprovedPersisted() {
@@ -133,7 +144,15 @@ function clearPendingPersisted() {
   state.pendingLabel = null;
   state.pendingIsLongRunning = false;
   state.pendingApprovedAt = null;
+  state.pendingStartedAt = null;
   savePersisted();
+}
+
+// Combined helper — clears both in-memory pending machinery AND persisted pending
+// fields. Use this whenever a pending should be considered fully torn down.
+function clearPendingFully() {
+  resetPendingState();
+  clearPendingPersisted();
 }
 
 function persistedAsString() {
@@ -202,6 +221,17 @@ function fallbackCopy(text) {
 const DIAG_MAX_CHARS = 50000;
 const DIAG_TRIM_TO   = 40000;
 
+// Sanitize a command-string-style payload — masks `phrase:"..."` and `password:VAL`
+// occurrences anywhere in a string. Used both for command-input display and as a
+// final pass over JSON output (in case a server response echoes a command verbatim
+// in some unrelated field value).
+function maskSecretsInString(s) {
+  return String(s)
+    .replace(/phrase:\\?"[^"]*\\?"/g, 'phrase:"<hidden>"')
+    .replace(/password:[^"\s,}\]]+/g, "password:<hidden>");
+}
+function maskCommand(c) { return maskSecretsInString(c); }
+
 function diagLog(direction, payload) {
   const el = document.getElementById("diag-log");
   if (!el) return;
@@ -212,25 +242,21 @@ function diagLog(direction, payload) {
   } else {
     try {
       s = JSON.stringify(payload, (k, v) => {
-        // Mask secrets in diag output
+        // Mask secrets at JSON-key level
         if (k === "phrase" || k === "password") return "<hidden>";
         return v;
       });
       if (s.length > 800) s = s.slice(0, 800) + "…(truncated)";
     } catch (_e) { s = String(payload); }
   }
+  // Defence-in-depth: mask any leaked phrase:"..." or password:... substrings that
+  // didn't get caught by the JSON-key replacer (e.g. echoed command strings)
+  s = maskSecretsInString(s);
   // Cap buffer size — long sessions otherwise leak memory and slow rendering
   let cur = el.textContent;
   if (cur.length > DIAG_MAX_CHARS) cur = "…(older entries trimmed)\n" + cur.slice(-DIAG_TRIM_TO);
   el.textContent = cur + `[${ts}] ${direction} ${s}\n`;
   el.scrollTop = el.scrollHeight;
-}
-
-// Sanitize a command string for diag/log display — masks any phrase: or password: arg
-function maskCommand(c) {
-  return String(c)
-    .replace(/phrase:"[^"]*"/g, 'phrase:"<hidden>"')
-    .replace(/password:\S+/g, "password:<hidden>");
 }
 
 // ============================================================================
@@ -290,6 +316,7 @@ function resetPendingState() {
   pendingState.startedAt = null;
   pendingState.approvedAt = null;
   pendingState.isLongRunning = false;
+  pendingNullCount = 0;
 }
 
 function showPendingBar(label, uid, title) {
@@ -373,6 +400,16 @@ function isLongRunningCommand(c) {
 function waitForPendingResolution(commandStr, uid) {
   const label = (commandStr.split(" ")[0] || commandStr).slice(0, 32);
   const longRunning = isLongRunningCommand(commandStr);
+  // Set in-memory pending state FIRST so showPendingBar reads correct values
+  // (pendingState.approvedAt drives the manual-approve button visibility)
+  pendingState.uid     = (uid || "").toLowerCase();
+  pendingState.command = commandStr;
+  pendingState.label   = label;
+  pendingState.startedAt = Date.now();
+  pendingState.approvedAt = null;
+  pendingState.isLongRunning = longRunning;
+  pendingNullCount = 0;
+
   showPendingBar(label, uid, "This action needs pending approval");
   diagLog("PENDING", { command: label, uid: uid, longRunning: longRunning });
 
@@ -383,11 +420,6 @@ function waitForPendingResolution(commandStr, uid) {
   return new Promise((resolve, reject) => {
     pendingState.resolve = resolve;
     pendingState.reject  = reject;
-    pendingState.uid     = (uid || "").toLowerCase();
-    pendingState.command = commandStr;
-    pendingState.label   = label;
-    pendingState.startedAt = Date.now();
-    pendingState.isLongRunning = longRunning;
 
     if (pendingState.timer) clearInterval(pendingState.timer);
     pendingState.timer = setInterval(checkPendingResolution, 2000);
@@ -395,6 +427,11 @@ function waitForPendingResolution(commandStr, uid) {
     checkPendingResolution();
   });
 }
+
+// Track consecutive null returns from isUidStillPending so we can fall back to
+// manual-only after sustained MDS connectivity failure (rather than poll forever).
+let pendingNullCount = 0;
+const PENDING_NULL_GIVEUP = 15;            // 15 polls × 2s = 30s of failures
 
 async function checkPendingResolution() {
   if (!pendingState.uid) return;        // already resolved
@@ -414,19 +451,33 @@ async function checkPendingResolution() {
     return;
   }
 
-  $("pending-bar-poll").textContent =
-    pendingState.uid === "(unknown)"
-      ? "waiting for you to tap 'I've already approved it' once you've approved in MiniHub"
-      : "checking every 2s — last check " + elapsed + "s ago";
-
-  if (pendingState.uid === "(unknown)") return;  // can't auto-detect; wait for manual button
+  if (pendingState.uid === "(unknown)") {
+    $("pending-bar-poll").textContent =
+      "waiting for you to tap 'I've already approved it' once you've approved in MiniHub";
+    return;  // can't auto-detect; wait for manual button
+  }
 
   const stillPending = await isUidStillPending(pendingState.uid);
   if (stillPending === false) {
-    // UID is no longer in the pending list — approval (or denial) happened
+    pendingNullCount = 0;
     onPendingApproved();
+    return;
   }
-  // null = couldn't tell; just keep polling
+  if (stillPending === null) {
+    pendingNullCount++;
+    if (pendingNullCount >= PENDING_NULL_GIVEUP) {
+      $("pending-bar-poll").textContent =
+        "auto-detection failed — approve in MiniHub then tap 'I've already approved it' below";
+      return;
+    }
+    $("pending-bar-poll").textContent =
+      "checking every 2s — node not responding (" + pendingNullCount + "/" + PENDING_NULL_GIVEUP + " failures)";
+    return;
+  }
+  // stillPending === true — keep polling normally
+  pendingNullCount = 0;
+  $("pending-bar-poll").textContent =
+    "checking every 2s — last check " + elapsed + "s ago";
 }
 
 function onPendingApproved() {
@@ -676,8 +727,11 @@ function detectPlatform() {
 // ============================================================================
 
 function onWelcomeStart() {
-  // No persisted state at this point — but in case the user clicked Start over and
-  // is starting fresh with stale state, clear it.
+  // Tear down any in-flight pending banner / poll / state from a previous run
+  // before clearing persisted state. Without this, a leftover banner and timer
+  // would survive the "Start over" click and confuse the next pending action.
+  hidePendingBar();
+  resetPendingState();
   clearPersisted();
   state.compromisedSeed = null;
   state.customDest = null;
@@ -875,10 +929,11 @@ async function onRunSync() {
     "Running megammrsync against " + state.selectedHost + " — this can take 1–2 minutes…");
   startLiveTerminal("sync-log", "megammrsync action:resync (importing compromised seed)");
   try {
-    // Persist BEFORE issuing — covers the case where the command succeeds but the dapp
-    // dies/closes before we reach the post-await code path.
-    state.stage = "import_sync_pending";
-    savePersisted();
+    // NOTE: stage is NOT advanced before await. If we did and the user closed
+    // the dapp during the pending wait (or the sync failed), we'd resume to the
+    // sweep step thinking the seed had been swapped — and show the host's own
+    // balance as recoverable. The pending-uid persistence inside cmd() handles
+    // recovery; the stage only advances once the megammrsync truly returns.
 
     const phrase = state.compromisedSeed.replace(/"/g, '\\"');
     const c = "megammrsync action:resync host:" + state.selectedHost +
@@ -889,8 +944,10 @@ async function onRunSync() {
     appendLog("sync-log", JSON.stringify(r.response || r, null, 2));
     stopLiveTerminal("sync complete");
 
-    // The compromised seed is now in the node — we no longer need to keep it in memory
+    // Sync truly completed (cmd resolved). NOW advance the stage.
+    state.stage = "import_sync_pending";
     state.compromisedSeed = null;
+    savePersisted();
 
     setStatus("sync-status", "Sync complete. Restart Minima now.", "ok");
     enterReboot1();
@@ -900,8 +957,7 @@ async function onRunSync() {
     setStatus("sync-status",
       'Sync failed: ' + e.message + '. Click "Try a different host", then "Run megammrsync" again.', "err");
     $("sync-run-btn").disabled = false;
-    state.stage = null;
-    savePersisted();
+    // Stage was never advanced, so no rollback needed.
   }
 }
 
@@ -933,6 +989,46 @@ async function enterSweepStep() {
   try {
     await loadSweepBalance();
     setStatus("sweep-loading-status", "");
+
+    // If a previous sweep attempt left progress, render it BEFORE deciding what
+    // to do next. The user can retry remaining tokens or proceed to restore.
+    if (Array.isArray(state.sweepProgress) && state.sweepProgress.length > 0) {
+      const root = $("sweep-results");
+      root.innerHTML = "";
+      let pendingCount = 0, sentCount = 0, failedCount = 0;
+      state.sweepProgress.forEach(entry => {
+        const row = document.createElement("div");
+        row.className = "sweep-result";
+        if (entry.status === "sent") row.classList.add("ok");
+        if (entry.status === "failed") row.classList.add("err");
+        const lbl = document.createElement("span");
+        lbl.className = "lbl";
+        lbl.textContent = entry.sendable + " " + entry.name;
+        const result = document.createElement("span");
+        result.className = "result";
+        result.textContent = entry.status;
+        row.appendChild(lbl);
+        row.appendChild(result);
+        root.appendChild(row);
+        if (entry.status === "sent")    sentCount++;
+        if (entry.status === "failed")  failedCount++;
+        if (entry.status === "pending") pendingCount++;
+      });
+      if (pendingCount === 0 && failedCount === 0) {
+        // All sent — proceed straight to the next-step button
+        setStatus("sweep-status", "All " + sentCount + " transfer(s) already submitted in a previous attempt.", "ok");
+        $("sweep-next-row").hidden = false;
+        return;
+      }
+      // Partial sweep — show retry option
+      setStatus("sweep-status",
+        sentCount + " already sent, " + (pendingCount + failedCount) + " remaining. Click Send to retry the remaining tokens.", "warn");
+      $("sweep-confirm-block").hidden = false;
+      bindSweepConfirmListeners();
+      updateSweepEnabled();
+      return;
+    }
+
     if (state.balances.length === 0) {
       $("sweep-empty-warn").hidden = false;
     } else {
@@ -1053,40 +1149,71 @@ async function onSweep() {
   root.innerHTML = "";
   $("sweep-go-btn").disabled = true;
   setStatus("sweep-status", "Sending…");
-  let ok = 0, err = 0;
-  for (const b of state.balances) {
+
+  // Initialise per-token progress tracking. If state.sweepProgress already exists
+  // (e.g. from a previous attempt that partially completed), preserve it and only
+  // re-attempt tokens that aren't already "sent".
+  if (!Array.isArray(state.sweepProgress)) {
+    state.sweepProgress = state.balances.map(b => ({
+      tokenid: b.tokenid,
+      sendable: b.sendable,
+      name: b.name,
+      status: "pending",
+    }));
+    savePersisted();
+  }
+
+  let ok = 0, err = 0, skipped = 0;
+  for (const entry of state.sweepProgress) {
     const row = document.createElement("div");
     row.className = "sweep-result";
     const lbl = document.createElement("span");
     lbl.className = "lbl";
-    lbl.textContent = b.sendable + " " + b.name;
+    lbl.textContent = entry.sendable + " " + entry.name;
     const result = document.createElement("span");
     result.className = "result";
-    result.textContent = "sending…";
     row.appendChild(lbl);
     row.appendChild(result);
     root.appendChild(row);
+
+    if (entry.status === "sent") {
+      // Already sent in a previous attempt — skip
+      row.classList.add("ok");
+      result.textContent = "sent (previous attempt)";
+      ok++; skipped++;
+      continue;
+    }
+
+    result.textContent = "sending…";
     try {
-      const c = "send address:" + dest + " amount:" + b.sendable +
-                (b.tokenid === "0x00" ? "" : " tokenid:" + b.tokenid);
-      // cmd() handles pending transparently via the sticky banner + auto-polling.
-      // If pending fires for this send, the row stays "sending…" until approved.
+      const c = "send address:" + dest + " amount:" + entry.sendable +
+                (entry.tokenid === "0x00" ? "" : " tokenid:" + entry.tokenid);
       result.textContent = "queued — see sticky banner if pending";
       const r = await cmd(c);
       row.classList.add("ok");
       result.textContent = "sent";
+      entry.status = "sent";
+      savePersisted();              // persist after each successful send
       ok++;
     } catch (e) {
       row.classList.add("err");
       result.textContent = "failed: " + e.message;
+      entry.status = "failed";
+      savePersisted();
       err++;
     }
   }
+
   if (err === 0) {
-    setStatus("sweep-status", "All " + ok + " transfer(s) submitted. Continue to restore.", "ok");
+    const sentMsg = skipped > 0
+      ? "All " + ok + " transfer(s) accounted for (" + (ok - skipped) + " new + " + skipped + " from previous attempt). Continue to restore."
+      : "All " + ok + " transfer(s) submitted. Continue to restore.";
+    setStatus("sweep-status", sentMsg, "ok");
   } else {
     setStatus("sweep-status",
-      ok + " ok, " + err + " failed. You can still continue to restore — but the failed token(s) remain at the compromised address.", "err");
+      ok + " ok, " + err + " failed. You can retry by clicking Send again — already-sent tokens will be skipped automatically.", "err");
+    // Re-enable the button so the user can retry the failed tokens
+    $("sweep-go-btn").disabled = false;
   }
   state.stage = "swept";
   savePersisted();
@@ -1158,8 +1285,9 @@ async function onRestoreRun() {
   appendLog("restore-log", "> megammrsync action:resync host:" + state.selectedHost +
                           " file:" + state.backupFile + " password:<hidden>");
   try {
-    state.stage = "restore_sync_pending";
-    savePersisted();
+    // NOTE: stage is NOT advanced before await — same reasoning as onRunSync.
+    // If we set "restore_sync_pending" pre-await and the user closed during the
+    // pending wait, resume would jump to verify thinking restore had completed.
 
     const c = "megammrsync action:resync host:" + state.selectedHost +
               " file:" + state.backupFile +
@@ -1167,6 +1295,11 @@ async function onRestoreRun() {
     const r = await cmd(c);
     appendLog("restore-log", JSON.stringify(r.response || r, null, 2));
     stopLiveTerminal("restore complete");
+
+    // Restore truly completed. NOW advance the stage.
+    state.stage = "restore_sync_pending";
+    savePersisted();
+
     setStatus("restore-status", "Restore command returned. Restart Minima now.", "ok");
     show("reboot2");
   } catch (e) {
@@ -1174,8 +1307,7 @@ async function onRestoreRun() {
     appendLog("restore-log", "ERROR: " + e.message);
     setStatus("restore-status", "Restore failed: " + e.message, "err");
     $("restore-run-btn").disabled = false;
-    state.stage = "swept";
-    savePersisted();
+    // Stage stays at "swept" — restore can be retried.
   }
 }
 
@@ -1507,14 +1639,32 @@ function wireUp() {
 
 // Re-attach the pending banner if a pending action was in-flight when the dapp
 // was last closed (e.g. user went to MiniHub to approve and is now back). Resumes
-// polling and resolves the (newly created) Promise when approval is detected.
+// polling. Returns a Promise that resolves when the pending is approved (and the
+// post-approval wait completes for long-running commands), or rejects on dismiss.
+//
+// CALLERS MUST AWAIT or chain `.then()` on the returned Promise — failing to do so
+// leaves the next-step code running while pending is still in flight, with the
+// banner up but no progression mechanism when pending finally resolves.
 function reattachPendingFromPersisted() {
   if (!state.pendingUid) return null;
   const uid = state.pendingUid;
   const label = state.pendingLabel || "(unknown)";
   const longRunning = !!state.pendingIsLongRunning;
   const wasApproved = state.pendingApprovedAt;
+  const origStartedAt = state.pendingStartedAt || Date.now();
   diagLog("PENDING-REATTACH", { uid: uid, label: label, longRunning: longRunning, approvedAt: wasApproved });
+
+  // CRITICAL: assign pendingState BEFORE showPendingBar — showPendingBar reads
+  // pendingState.approvedAt to decide manual-approve button visibility. If we set
+  // this after showing the bar, a re-attached post-approval-wait would briefly
+  // show the manual-approve button and a click on it would restart the clock.
+  pendingState.uid = uid;
+  pendingState.command = label;
+  pendingState.label = label;
+  pendingState.startedAt = origStartedAt;
+  pendingState.approvedAt = wasApproved || null;
+  pendingState.isLongRunning = longRunning;
+  pendingNullCount = 0;
 
   showPendingBar(label, uid, wasApproved
     ? "Approved — sync running on node (do NOT restart yet)"
@@ -1523,16 +1673,22 @@ function reattachPendingFromPersisted() {
   return new Promise((resolve, reject) => {
     pendingState.resolve = resolve;
     pendingState.reject = reject;
-    pendingState.uid = uid;
-    pendingState.command = label;
-    pendingState.label = label;
-    pendingState.startedAt = Date.now();
-    pendingState.approvedAt = wasApproved || null;
-    pendingState.isLongRunning = longRunning;
 
     if (pendingState.timer) clearInterval(pendingState.timer);
     pendingState.timer = setInterval(checkPendingResolution, 2000);
     checkPendingResolution();
+  });
+}
+
+// Helper: wait for any in-flight pending to complete, then run `next`. If there
+// is no in-flight pending, run `next` immediately. If the user dismisses the
+// pending, fall back to `onDismissed` (defaults to no-op).
+function awaitPendingThen(next, onDismissed) {
+  const p = reattachPendingFromPersisted();
+  if (!p) { next(); return; }
+  p.then(next).catch(err => {
+    diagLog("PENDING-REATTACH-ERR", err && err.message);
+    if (onDismissed) onDismissed();
   });
 }
 
@@ -1547,10 +1703,9 @@ function resumeFromPersisted() {
   switch (p.stage) {
     case "snapshot_done":
       // User did the backup, possibly closed the dapp to approve it in MiniHub
-      // Pending, and is now back. Re-attach the pending banner if needed; otherwise
-      // jump to the seed-paste step with backup credentials preserved.
+      // Pending, and is now back. Show the snapshot card with credentials; if
+      // there's still an in-flight pending, the banner re-attaches at the top.
       show("snapshot");
-      // Re-render the snapshot info from persisted state
       $("snap-backup-info").hidden = false;
       $("snap-backup-file").textContent = state.backupFile || "(missing)";
       $("snap-backup-password").textContent = state.backupPassword || "(missing)";
@@ -1558,31 +1713,43 @@ function resumeFromPersisted() {
       $("snap-continue-btn").disabled = false;
       setStatus("snap-backup-status",
         "Welcome back — backup is recorded. Continue when ready.", "ok");
-      reattachPendingFromPersisted();         // no-op if no pending was in flight
-      break;
-    case "import_sync_pending":
-      // node has been rebooted (else MDS wouldn't be inited). Resume to sweep.
+      // If a pending is still in flight (user hasn't approved yet OR is mid-sync),
+      // re-attach the banner. The Continue button is independent — user can move
+      // forward once they've approved AND want to proceed.
       reattachPendingFromPersisted();
-      enterSweepStep();
       break;
+
+    case "import_sync_pending":
+      // The megammrsync(import) cmd resolved successfully BEFORE this stage was set,
+      // so the import truly happened. Resume to sweep.
+      // BUT — there may still be a residual pending if the user is reattaching
+      // mid-flow for some other command (rare). Wait for it before doing destructive
+      // queries against the imported wallet.
+      show("sync");
+      setStatus("sync-status", "Welcome back — moving to the sweep step…", "ok");
+      awaitPendingThen(() => enterSweepStep());
+      break;
+
     case "swept":
       // user closed dapp before triggering restore; resume to restore step
       show("restore");
       setStatus("restore-status", "Welcome back — your sweep is recorded. Restore is the next step.", "ok");
-      reattachPendingFromPersisted();
-      enterRestoreStep();
+      awaitPendingThen(() => enterRestoreStep());
       break;
+
     case "restore_sync_pending":
+      // Restore truly completed before stage was set. Resume to verify.
       show("verify");
       setStatus("verify-status", "Welcome back — verifying the restore…", "ok");
-      reattachPendingFromPersisted();
-      enterVerifyStep();
+      awaitPendingThen(() => enterVerifyStep());
       break;
+
     case "verified":
       show("verify");
       $("verify-success").hidden = false;
       $("verify-status").textContent = "(previous run — flow already complete)";
       break;
+
     default:
       show("welcome");
   }
