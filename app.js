@@ -48,9 +48,7 @@ const state = {
   hostFingerprint: null,        // sha256[:16] of sorted default-Mx list
 
   // EPHEMERAL (per-session)
-  hostSeed: null,               // shown on snapshot, never persisted
-  hostMxSample: null,           // a default Mx to display
-  compromisedSeed: null,        // only used to issue megammrsync
+  compromisedSeed: null,        // only used to issue megammrsync, never persisted
   customDest: null,
   balances: [],
   importedAddresses: [],
@@ -258,6 +256,17 @@ function onWelcomeClear() {
 
 // ============================================================================
 // Step 1 — snapshot
+//
+// IMPORTANT: this step deliberately does NOT read or display the host node's
+// seed phrase. It only:
+//   - calls `getaddress` to capture a destination address (default-wallet pubkeys
+//     are stored unencrypted; this works on locked nodes too)
+//   - calls `scripts` to capture a wallet fingerprint for post-restore verification
+//   - calls `status` to detect whether the vault is locked (for a UI hint only)
+//   - runs `backup file:<rand>.bak password:<rand>` to produce an encrypted snapshot
+//     of whatever state the node currently has (locked or unlocked — backup honours
+//     either; if locked, the bak is locked too)
+// The user is responsible for having their own seed backup outside this dapp.
 // ============================================================================
 
 function enterSnapshotStep() {
@@ -265,138 +274,47 @@ function enterSnapshotStep() {
   state.backupFile = null;
   state.backupPassword = null;
   $("snap-backup-info").hidden = true;
-  $("snap-paper-check").checked = false;
   $("snap-pw-check").checked = false;
   $("snap-backup-btn").disabled = true;
   $("snap-continue-btn").disabled = true;
-  setStatus("snap-backup-status", "");
-  $("snap-mx").textContent = "loading…";
-  $("snap-seed").innerHTML = "<div class=\"hint\">Reading this node's seed and address…</div>";
-  $("snap-verify-prompts").innerHTML = "";
+  $("snap-locked-warn").hidden = true;
+  setStatus("snap-backup-status", "Reading this node's address & fingerprint (no seed access)…");
+  $("snap-dest").textContent = "loading…";
 
   loadSnapshotData()
-    .then(() => { startVerify(); updateSnapshotEnabled(); })
+    .then(() => {
+      setStatus("snap-backup-status", "");
+      $("snap-backup-btn").disabled = false;
+    })
     .catch(e => {
       setStatus("snap-backup-status",
-        "Failed to read this node's seed: " + e.message +
-        ". If this node has a password-locked vault, unlock it from the terminal first " +
-        "(vault action:passwordunlock password:…), then reload this dapp.", "err");
+        "Failed to probe this node: " + e.message +
+        ". The dapp needs read access to getaddress, scripts and status — these all work on locked nodes too. Check the dapp's MDS permission.", "err");
     });
 }
 
 async function loadSnapshotData() {
-  const v = await cmd("vault");
-  const vr = v.response || {};
-  state.hostSeed = (vr.phrase || vr.seedphrase || vr.seed || "").trim();
-  if (!state.hostSeed) throw new Error("vault returned no seed");
-
+  // Capture destination address from getaddress — this is one of the 64 default
+  // addresses; it belongs to the host wallet and we'll sweep recovered funds back
+  // to it. getaddress works on locked nodes (default pubkeys are stored unencrypted).
   const a = await cmd("getaddress");
   const ar = a.response || {};
-  state.hostMxSample = ar.miniaddress || ar.address || "";
-  if (!state.hostMxSample) throw new Error("getaddress returned no address");
+  state.destinationMx = ar.miniaddress || ar.address || "";
+  if (!state.destinationMx) throw new Error("getaddress returned no address");
+  $("snap-dest").textContent = state.destinationMx;
 
-  // also capture destination + fingerprint NOW, before any seed swap
-  state.destinationMx = state.hostMxSample;
+  // Capture wallet fingerprint for post-restore verification. Works on locked nodes.
   state.hostFingerprint = await computeWalletFingerprint();
 
-  renderSnapshotSeed();
-}
-
-function renderSnapshotSeed() {
-  $("snap-mx").textContent = state.hostMxSample;
-  const words = state.hostSeed.trim().split(/\s+/);
-  const grid = $("snap-seed");
-  grid.innerHTML = "";
-  if (words.length >= 12 && words.length <= 24) {
-    // word-list seed — render as numbered grid
-    words.forEach((w, i) => {
-      const wrap = document.createElement("div");
-      wrap.className = "seed-word";
-      const num = document.createElement("span");
-      num.className = "num";
-      num.textContent = (i + 1) + ".";
-      const ww = document.createElement("span");
-      ww.className = "w";
-      ww.textContent = w;
-      wrap.appendChild(num);
-      wrap.appendChild(ww);
-      grid.appendChild(wrap);
-    });
-  } else {
-    // single-string seed — render as one big block
-    const single = document.createElement("div");
-    single.className = "seed-single";
-    single.textContent = state.hostSeed;
-    grid.appendChild(single);
-  }
-}
-
-function startVerify() {
-  const words = state.hostSeed.trim().split(/\s+/);
-  const grid = $("snap-verify-prompts");
-  grid.innerHTML = "";
-
-  if (words.length >= 12 && words.length <= 24) {
-    const idxs = new Set();
-    const k = Math.min(3, words.length);
-    while (idxs.size < k) idxs.add(Math.floor(Math.random() * words.length));
-    Array.from(idxs).sort((a, b) => a - b).forEach(i => {
-      const row = document.createElement("div");
-      row.className = "verify-row";
-      const lbl = document.createElement("label");
-      lbl.textContent = "Word #" + (i + 1);
-      const input = document.createElement("input");
-      input.type = "text";
-      input.dataset.idx = String(i);
-      input.autocomplete = "off"; input.autocapitalize = "none";
-      input.autocorrect = "off"; input.spellcheck = false;
-      input.addEventListener("input", updateSnapshotEnabled);
-      row.appendChild(lbl);
-      row.appendChild(input);
-      grid.appendChild(row);
-    });
-  } else {
-    // single-string seed — ask user to retype it as a whole
-    const row = document.createElement("div");
-    row.className = "verify-row";
-    const lbl = document.createElement("label");
-    lbl.textContent = "Retype it";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.dataset.full = "true";
-    input.autocomplete = "off"; input.autocapitalize = "none";
-    input.autocorrect = "off"; input.spellcheck = false;
-    input.addEventListener("input", updateSnapshotEnabled);
-    row.appendChild(lbl);
-    row.appendChild(input);
-    grid.appendChild(row);
-  }
+  // Show a friendly warning if the node is currently password-locked
+  try {
+    const s = await cmd("status");
+    const locked = !!(s.response && s.response.locked);
+    $("snap-locked-warn").hidden = !locked;
+  } catch (_e) { /* not fatal */ }
 }
 
 function updateSnapshotEnabled() {
-  const inputs = document.querySelectorAll("#snap-verify-prompts input");
-  let allCorrect = inputs.length > 0;
-  if (inputs.length > 0 && inputs[0].dataset.full === "true") {
-    const got = (inputs[0].value || "").trim();
-    const row = inputs[0].closest(".verify-row");
-    if (got === state.hostSeed.trim()) row.classList.add("ok"), row.classList.remove("err");
-    else row.classList.add("err"), row.classList.remove("ok"), allCorrect = false;
-    if (!got) row.classList.remove("ok", "err"), allCorrect = false;
-  } else {
-    const words = (state.hostSeed || "").trim().split(/\s+/);
-    inputs.forEach(inp => {
-      const want = words[Number(inp.dataset.idx)];
-      const got = (inp.value || "").trim();
-      const row = inp.closest(".verify-row");
-      if (!got) { row.classList.remove("ok", "err"); allCorrect = false; return; }
-      if (got === want) row.classList.add("ok"), row.classList.remove("err");
-      else row.classList.add("err"), row.classList.remove("ok"), allCorrect = false;
-    });
-  }
-  const paperOk = $("snap-paper-check").checked;
-  const canBackup = allCorrect && paperOk && !!state.hostSeed;
-  if (!state.backupFile) $("snap-backup-btn").disabled = !canBackup;
-
   const backupDone = !!state.backupFile && !!state.backupPassword;
   const pwOk = $("snap-pw-check").checked;
   $("snap-continue-btn").disabled = !(backupDone && pwOk);
@@ -981,15 +899,11 @@ function wireUp() {
 
   // Step 1
   $("snap-back-btn").addEventListener("click", () => show("welcome"));
-  $("snap-paper-check").addEventListener("change", updateSnapshotEnabled);
   $("snap-pw-check").addEventListener("change", updateSnapshotEnabled);
   $("snap-backup-btn").addEventListener("click", onSnapBackup);
-  $("snap-copyseed-btn").addEventListener("click", () =>
-    copyText(state.hostSeed).then(ok =>
-      flashStatus("snap-backup-status", ok ? "Copied seed (wipe clipboard after pasting on paper)." : "Copy failed.")));
-  $("snap-copymx-btn").addEventListener("click", () =>
-    copyText(state.hostMxSample).then(ok =>
-      flashStatus("snap-backup-status", ok ? "Copied address." : "Copy failed.")));
+  $("snap-copyfile-btn").addEventListener("click", () =>
+    copyText(state.backupFile).then(ok =>
+      flashStatus("snap-backup-status", ok ? "Copied file path." : "Copy failed.")));
   $("snap-copypw-btn").addEventListener("click", () =>
     copyText(state.backupPassword).then(ok =>
       flashStatus("snap-backup-status", ok ? "Copied password (write it on paper)." : "Copy failed.")));

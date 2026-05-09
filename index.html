@@ -57,41 +57,31 @@
       <div id="step-snapshot" class="step">
         <div class="card">
           <div class="step-indicator">Step 1 of 5 — Snapshot this node</div>
-          <h2>Two pieces of paper insurance</h2>
-          <p class="hint">Both of these protect your existing wallet. If anything in the recovery goes wrong, either one alone is enough to put your node back to normal.</p>
+          <h2>Encrypted backup of this node</h2>
 
-          <h3>1A · Your node's current seed phrase</h3>
-          <div class="banner danger">
-            <strong>Write these words on PAPER. Not on this device.</strong>
-            This is the seed of <em>your</em> wallet. The dapp will temporarily replace it during recovery, then put it back. If the put-back fails, this paper is how you recover.
+          <div class="banner ok">
+            <strong>This dapp does NOT read your seed.</strong>
+            We'll run <code>backup</code> on this node — the resulting <code>.bak</code> file is encrypted with a random password the dapp generates. Your seed never leaves the secure-vault layer.
           </div>
+
+          <div class="banner warn">
+            <strong>Before continuing, confirm you already have your own off-device backup of this node's seed</strong> (paper, hardware wallet, separate device — anything you control). The dapp won't show you the seed and won't ask for it. If you need an absolute last-resort recovery path beyond the .bak file we're about to make, your existing seed backup is it.
+          </div>
+
+          <div id="snap-locked-warn" class="banner warn" hidden>
+            <strong>This node's vault is password-locked.</strong> The .bak we create will be locked too. To restore later, you'll need both the .bak password (shown below) AND your node's vault password (which the dapp doesn't know). Make sure you have the latter recorded somewhere safe.
+          </div>
+
           <div class="field-block">
-            <div class="field-label">A sample address from this node (Mx)</div>
-            <div id="snap-mx" class="value-block mono mx">…</div>
-          </div>
-          <div class="field-block">
-            <div class="field-label">This node's seed</div>
-            <div id="snap-seed" class="seed-grid">…</div>
-          </div>
-          <div class="actions row">
-            <button id="snap-copyseed-btn" class="btn">Copy seed</button>
-            <button id="snap-copymx-btn" class="btn">Copy address</button>
+            <div class="field-label">Recovered funds will be sent to this node's address</div>
+            <div id="snap-dest" class="value-block mono mx">…</div>
           </div>
 
-          <h3>1B · Prove you wrote it down</h3>
-          <p class="hint">Type the requested words from your paper to confirm.</p>
-          <div id="snap-verify-prompts" class="verify-grid"></div>
-          <label class="check-row">
-            <input type="checkbox" id="snap-paper-check" />
-            <span>I have written down all the words on paper, NOT stored on this device.</span>
-          </label>
-
-          <h3>1C · Encrypted backup file (the fast restore path)</h3>
-          <p class="hint">When you click below, the dapp will run <code>backup</code> on this node. The .bak file gets a randomly-generated password.</p>
           <div class="actions row">
-            <button id="snap-backup-btn" class="btn primary" disabled>Run backup</button>
+            <button id="snap-backup-btn" class="btn primary">Run backup</button>
           </div>
           <p id="snap-backup-status" class="status"></p>
+
           <div id="snap-backup-info" hidden>
             <div class="field-block">
               <div class="field-label">Backup file (full path)</div>
@@ -102,15 +92,16 @@
               <div id="snap-backup-password" class="value-block mono pw">…</div>
             </div>
             <div class="actions row">
+              <button id="snap-copyfile-btn" class="btn">Copy file path</button>
               <button id="snap-copypw-btn" class="btn">Copy password</button>
             </div>
             <div class="banner danger">
-              <strong>Write this password on the SAME piece of paper as your seed.</strong>
-              The .bak file is encrypted — without the password it's useless.
+              <strong>Write the backup password on paper.</strong>
+              Without it, the .bak file is useless. The dapp also keeps it in this dapp's local storage so the restore step can run automatically — but if you uninstall the dapp or clear browser data before finishing, you'll need the paper copy.
             </div>
             <label class="check-row">
               <input type="checkbox" id="snap-pw-check" />
-              <span>I have written the backup password down on paper.</span>
+              <span>I have written down both the file path AND the password.</span>
             </label>
           </div>
 

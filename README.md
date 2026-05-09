@@ -27,8 +27,10 @@ to weeks after the user's last legitimate webwallet activity.
 ## What the dapp does
 
 ```
-1. SNAPSHOT ─ back up the host node (encrypted with a random password) and force
-              the user to write down the host node's existing seed on paper.
+1. SNAPSHOT ─ run `backup file:<rand>.bak password:<rand>` to produce an encrypted
+              snapshot of the host node. Works on password-locked vaults too —
+              the .bak inherits the lock state. The dapp does NOT read or display
+              your seed at any point.
 2. POSSESS  ─ run megammrsync(action:resync, phrase:"<compromised seed>") to
               import the compromised wallet onto the host node.
               (The node restarts.)
@@ -41,7 +43,10 @@ to weeks after the user's last legitimate webwallet activity.
 ```
 
 The compromised seed never leaves the device — it goes only to the user's local
-MDS bridge, never to a remote server.
+MDS bridge, never to a remote server. The host node's own seed is never read by
+the dapp; the user is responsible for having an independent off-device backup of
+their existing seed (paper, hardware wallet, separate device) in case both the
+.bak path AND the dapp's restore step fail.
 
 ## Install
 
