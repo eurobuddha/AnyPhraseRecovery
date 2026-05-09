@@ -1,4 +1,4 @@
-// AnyPhraseRecovery v0.4.7 — sweep funds out of a compromised webWallet seed and restore
+// AnyPhraseRecovery v0.4.8 — sweep funds out of a compromised webWallet seed and restore
 // the host node back to its original state.
 //
 // The flow REQUIRES two node restarts (after each megammrsync). State is persisted to
@@ -66,6 +66,11 @@ const state = {
   pendingApprovedAt: null,      // ms epoch when approval was detected (null = pre-approval)
   pendingStartedAt: null,       // ms epoch when banner first went up (preserved across reload)
 
+  // PERSISTED — set immediately BEFORE issuing a write command so a dapp close in
+  // the microseconds before the pending response arrives doesn't lose the fact that
+  // the command was issued. Cleared as soon as the pending response is processed.
+  inflightCommandLabel: null,
+
   // PERSISTED — per-token sweep progress. Lets us resume a multi-token sweep without
   // re-sending tokens that already went out. Each entry: {tokenid, sendable, name, status}
   // status ∈ { "pending" | "sent" | "failed" }
@@ -98,6 +103,7 @@ function savePersisted() {
       pendingIsLongRunning: state.pendingIsLongRunning,
       pendingApprovedAt: state.pendingApprovedAt,
       pendingStartedAt: state.pendingStartedAt,
+      inflightCommandLabel: state.inflightCommandLabel,
       sweepProgress: state.sweepProgress,
     }));
   } catch (_e) { /* localStorage may be unavailable; flow degrades but won't crash */ }
@@ -132,6 +138,7 @@ function clearPersisted() {
   state.pendingIsLongRunning = false;
   state.pendingApprovedAt = null;
   state.pendingStartedAt = null;
+  state.inflightCommandLabel = null;
   state.sweepProgress = null;
   state.megammrDownloadPath = null;
 }
@@ -298,6 +305,7 @@ function diagLog(direction, payload) {
 const MEGAMMRSYNC_RUN_SECONDS = 90;          // post-approval wait before allowing restart
 const CMD_TIMEOUT_MS_DEFAULT = 60000;        // default per-cmd timeout
 const CMD_TIMEOUT_MS_LONG    = 300000;       // for backup / megammrsync (5 min)
+const PENDING_CONFIRM_SECONDS = 3;           // post-detection window for user to say "actually I denied"
 
 class PendingDismissedError extends Error {
   constructor() { super("Pending action dismissed by user"); this.name = "PendingDismissedError"; }
@@ -312,12 +320,14 @@ class CmdTimeoutError extends Error {
 let pendingState = {
   resolve: null,
   reject: null,
-  uid: null,                // lowercase hex, or "(unknown)" if we can't identify it
-  label: null,              // short display label (also used as pendingLabel persisted)
-  startedAt: null,          // ms epoch when banner went up
-  approvedAt: null,         // ms epoch when UID disappeared from pending list (or manual)
-  timer: null,              // setInterval handle for polling
-  isLongRunning: false,     // true for megammrsync (post-approval wait required)
+  uid: null,                  // lowercase hex, or "(unknown)" if we can't identify it
+  label: null,                // short display label (also used as pendingLabel persisted)
+  startedAt: null,            // ms epoch when banner went up
+  approvedAt: null,           // ms epoch when UID disappeared from pending list (or manual)
+  confirmingDetectedAt: null, // ms epoch when checkpending detected UID gone — gives user
+                              // a brief window to say "I actually denied" before auto-approve
+  timer: null,                // setInterval handle for polling
+  isLongRunning: false,       // true for megammrsync (post-approval wait required)
 };
 
 function clearPendingTimer() {
@@ -332,6 +342,7 @@ function resetPendingState() {
   pendingState.label = null;
   pendingState.startedAt = null;
   pendingState.approvedAt = null;
+  pendingState.confirmingDetectedAt = null;
   pendingState.isLongRunning = false;
   pendingNullCount = 0;
 }
@@ -341,10 +352,21 @@ function showPendingBar(label, uid, title) {
   $("pending-bar-cmd").textContent = label;
   $("pending-bar-uid").textContent = "uid " + (uid === "(unknown)" ? "(unknown — use 'I approved it' button)" : uid);
   $("pending-bar-poll").textContent = "…waiting";
-  // The "I approved it" button is meaningful BEFORE approval is recorded.
-  // Once approval is recorded (post-approval wait), hide it so the user can't
-  // accidentally restart the wait clock.
-  $("pending-bar-confirm").hidden = !!pendingState.approvedAt;
+  // Confirm-button label flips depending on which phase we're in:
+  //   pre-approval, polling      → "I've already approved it" (fast-path success)
+  //   post-detect confirmation   → "Cancel — I actually denied" (chance to abort)
+  //   long-running post-approval → hidden (action is irreversibly running on node)
+  const btn = $("pending-bar-confirm");
+  if (pendingState.confirmingDetectedAt) {
+    btn.textContent = "Cancel — I actually denied";
+    btn.hidden = false;
+  } else if (pendingState.approvedAt) {
+    btn.textContent = "I've already approved it";
+    btn.hidden = true;
+  } else {
+    btn.textContent = "I've already approved it";
+    btn.hidden = false;
+  }
   $("pending-bar").hidden = false;
 }
 
@@ -453,30 +475,60 @@ async function checkPendingResolution() {
   if (!pendingState.uid) return;        // already resolved
   const elapsed = Math.floor((Date.now() - pendingState.startedAt) / 1000);
 
+  // Phase 3: long-running command, post-approval wait
   if (pendingState.approvedAt) {
-    // Long-running command — post-approval wait
     const sincApproved = Math.floor((Date.now() - pendingState.approvedAt) / 1000);
     const remaining = MEGAMMRSYNC_RUN_SECONDS - sincApproved;
     if (remaining > 0) {
       $("pending-bar-poll").textContent =
         "approved — running on node, ~" + remaining + "s remaining (DO NOT restart yet)";
     } else {
-      // post-approval wait complete — resolve as success
       finalisePendingSuccess();
     }
     return;
   }
 
+  // Phase 2: UID gone from pending list, but we don't know if user APPROVED or
+  // DENIED — both look identical to checkpending. Show a brief confirmation window
+  // where the user can say "I actually denied" if they cancelled in MiniHub.
+  // After PENDING_CONFIRM_SECONDS, auto-finalise as approved.
+  if (pendingState.confirmingDetectedAt) {
+    const remain = PENDING_CONFIRM_SECONDS -
+      Math.floor((Date.now() - pendingState.confirmingDetectedAt) / 1000);
+    if (remain <= 0) {
+      pendingState.confirmingDetectedAt = null;
+      onPendingApproved();
+      return;
+    }
+    $("pending-bar-poll").textContent =
+      "Pending resolved — assuming approval in " + remain + "s (click Cancel if you denied)";
+    return;
+  }
+
+  // Phase 1a: unknown UID — purely manual via "I've already approved it" button
   if (pendingState.uid === "(unknown)") {
     $("pending-bar-poll").textContent =
       "waiting for you to tap 'I've already approved it' once you've approved in MiniHub";
-    return;  // can't auto-detect; wait for manual button
+    return;
   }
 
+  // Phase 1b: poll for UID to disappear from pending list
   const stillPending = await isUidStillPending(pendingState.uid);
   if (stillPending === false) {
+    // Detected resolution — enter confirmation phase. NOTE: we deliberately
+    // do NOT immediately call onPendingApproved, because checkpending can't
+    // distinguish "approved" from "denied" — both result in the UID leaving
+    // the list. The confirmation window gives the user a chance to cancel
+    // if they actually denied (silently treating denial as success would
+    // advance the dapp into a step that later fails on a missing backup,
+    // missing send, etc).
     pendingNullCount = 0;
-    onPendingApproved();
+    pendingState.confirmingDetectedAt = Date.now();
+    showPendingBar(
+      pendingState.label,
+      pendingState.uid,
+      "Pending resolved — confirming approval"
+    );
     return;
   }
   if (stillPending === null) {
@@ -528,8 +580,17 @@ function finalisePendingSuccess() {
 }
 
 function onPendingManualApprove() {
-  // User clicked "I approved it" — treat as approved immediately
   if (!pendingState.uid) return;
+  // The confirm button has TWO meanings depending on phase:
+  //   confirmingDetectedAt set → button is "Cancel — I actually denied"
+  //                              → treat click as dismiss
+  //   otherwise                 → button is "I've already approved it"
+  //                              → fast-path the approval
+  if (pendingState.confirmingDetectedAt) {
+    diagLog("PENDING-MANUAL-DENY-DURING-CONFIRM", { uid: pendingState.uid, label: pendingState.label });
+    onPendingDismiss();
+    return;
+  }
   diagLog("PENDING-MANUAL-APPROVE", { uid: pendingState.uid, label: pendingState.label });
   onPendingApproved();
 }
@@ -563,24 +624,34 @@ async function cmd(c, opts) {
   opts = opts || {};
   const timeoutMs = opts.timeout
     || (isLongRunningCommand(c) || /^backup /.test(c) ? CMD_TIMEOUT_MS_LONG : CMD_TIMEOUT_MS_DEFAULT);
+  const cmdLabel = (c.split(" ")[0] || c).slice(0, 32);
 
   diagLog("CMD→", maskCommand(c));
-  // NOTE: we do NOT pre-snapshot the pending list here. Listing pending via
-  // `mds action:pending` itself queues a new pending entry in READ mode (because
-  // the `mds` namespace contains accept/deny/install actions, so MDS treats every
-  // call to it as write-protected). That caused a cascade: a single backup
-  // request created 6+ pending entries. Instead we rely on extractPendingUid()
-  // (which works for response.uid / response.pending="0xUID" / error-string with
-  // 0x...) and fall back to the manual "I've already approved it" button.
+  // Mark the command as in-flight BEFORE issuing it. If the dapp closes in the
+  // microseconds between rawCmd issuing and the MDS response arriving (which
+  // would have triggered setPendingPersisted), this hint lets resumeFromPersisted
+  // detect the interrupted command and offer recovery rather than silently
+  // re-issuing it on next open.
+  if (!isReadOnlyCmd(c)) {
+    state.inflightCommandLabel = cmdLabel;
+    savePersisted();
+  }
 
   let r;
   try {
     r = await rawCmd(c, timeoutMs);
   } catch (e) {
     diagLog("ERR←", e.message);
+    state.inflightCommandLabel = null;
+    savePersisted();
     throw e;
   }
   diagLog("RES←", r);
+
+  // Response received — clear the inflight hint. If pending fires below,
+  // setPendingPersisted will set the proper pendingUid record.
+  state.inflightCommandLabel = null;
+  savePersisted();
 
   if (isPendingResponse(r)) {
     const uid = extractPendingUid(r);
@@ -589,6 +660,16 @@ async function cmd(c, opts) {
 
   if (r && r.status) return r;
   throw new Error((r && r.error) || ("command failed: " + (c.split(" ")[0] || c)));
+}
+
+// Read-only commands cannot pend; skip the inflight hint for them.
+const READ_ONLY_CMDS_SET = new Set([
+  "balance", "getaddress", "scripts", "status", "block", "history", "coins",
+  "checkmode", "checkpending", "tokens", "txnlist", "keys",
+]);
+function isReadOnlyCmd(c) {
+  const head = (String(c).trim().split(/\s+/)[0] || "").toLowerCase();
+  return READ_ONLY_CMDS_SET.has(head);
 }
 
 // ============================================================================
@@ -1448,6 +1529,11 @@ function onFinishRestart() {
 }
 
 function onWelcomeClear() {
+  // Mirror onWelcomeStart: tear down any in-flight pending banner / poll / state
+  // BEFORE clearing persisted state, so a leftover banner doesn't survive the
+  // clear and confuse the user.
+  hidePendingBar();
+  resetPendingState();
   clearPersisted();
   flashStatus("welcome-perm-warn", "Saved state cleared. Click Get started to begin a fresh recovery.", "ok");
   show("welcome");
@@ -1741,11 +1827,39 @@ function resumeFromPersisted() {
   const p = loadPersisted();
   if (!p) { show("welcome"); return; }
   Object.assign(state, p);
-  diagLog("RESUME", { stage: p.stage, pendingLabel: p.pendingLabel, hasPending: !!p.pendingUid });
+  diagLog("RESUME", {
+    stage: p.stage,
+    pendingLabel: p.pendingLabel,
+    hasPending: !!p.pendingUid,
+    inflight: p.inflightCommandLabel,
+  });
+
+  // Defensive: if pending uid is set without a label (or vice-versa), the persist
+  // invariant is broken — clear it and route by stage instead.
+  if ((state.pendingUid && !state.pendingLabel) || (!state.pendingUid && state.pendingLabel)) {
+    diagLog("RESUME-INVARIANT-VIOLATION",
+      "pending uid/label out of sync: " + state.pendingUid + " / " + state.pendingLabel);
+    clearPendingFully();
+  }
 
   // Pending in flight? Route by pendingLabel BEFORE stage.
   if (state.pendingUid && state.pendingLabel) {
     return resumePendingByLabel();
+  }
+
+  // Inflight hint set but no pending UID? The cmd was issued but the response
+  // never landed (dapp closed in the microsecond window OR command failed silently).
+  // Surface this so the user can retry their last action rather than blindly
+  // continuing down the flow as if nothing happened.
+  if (state.inflightCommandLabel) {
+    diagLog("RESUME-INFLIGHT-INTERRUPTED", state.inflightCommandLabel);
+    state.inflightCommandLabel = null;
+    savePersisted();
+    show("welcome");
+    flashStatus("welcome-perm-warn",
+      "Welcome back — your last action was interrupted before completing. Click Get started or use Clear saved state to retry.",
+      "warn");
+    return;
   }
 
   // No in-flight pending — route by stage
@@ -1764,8 +1878,9 @@ function resumeFromPersisted() {
       break;
 
     case "import_sync_done":
+      // Don't pre-set sweep-loading-status — enterSweepStep immediately overwrites
+      // it with its own "Loading balance…" text, hiding the welcome message anyway.
       show("sweep");
-      setStatus("sweep-loading-status", "Welcome back — loading sweep…", "ok");
       enterSweepStep();
       break;
 
@@ -1810,16 +1925,34 @@ function resumePendingByLabel() {
 
 function resumeBackupPending() {
   show("snapshot");
+  // Defensive: if persisted credentials are somehow missing, surface clearly
+  // rather than render "null".
+  const fileTxt = state.backupFile || "(missing — please dismiss banner and start over)";
+  const pwTxt   = state.backupPassword || "(missing — please dismiss banner and start over)";
   $("snap-backup-info").hidden = false;
-  $("snap-backup-file").textContent = state.backupFile + "  (full path will appear after backup completes)";
-  $("snap-backup-password").textContent = state.backupPassword;
-  $("snap-pw-check").checked = false;       // can't continue until backup is truly approved
+  $("snap-backup-file").textContent = fileTxt +
+    (state.backupFile ? "  (filename only — absolute path is only known if backup ran synchronously)" : "");
+  $("snap-backup-password").textContent = pwTxt;
+  $("snap-pw-check").checked = false;
   $("snap-continue-btn").disabled = true;
   setStatus("snap-backup-status",
     "Welcome back — backup is still pending approval (banner above shows steps).", "warn");
+
+  // Probe vault lock state — same as enterSnapshotStep does. Skipping this would
+  // hide the warning that .bak inherits the locked state.
+  cmd("status").then(s => {
+    const locked = !!(s && s.response && s.response.locked);
+    $("snap-locked-warn").hidden = !locked;
+  }).catch(() => { /* not fatal */ });
+
   awaitPendingThen(() => {
     state.stage = "snapshot_done";
     savePersisted();
+    // Update file display: drop the "filename only" annotation now that the
+    // backup is confirmed (still no absolute path for pending-approved backups,
+    // but the user knows the bak is a real file at this point).
+    $("snap-backup-file").textContent = state.backupFile +
+      "  (in your Minima data folder; absolute path not known for pending-approved backups)";
     $("snap-pw-check").checked = true;
     $("snap-continue-btn").disabled = false;
     setStatus("snap-backup-status",
@@ -1837,8 +1970,22 @@ function resumeBackupPending() {
 }
 
 function resumeSyncPending() {
-  setupHostStep();         // re-render the host pick UI
   show("sync");
+  // Render the host UI WITHOUT calling setupHostStep — that would clobber
+  // state.selectedHost and re-enable the Run button while the original sync
+  // is still pending in MDS, allowing a second concurrent megammrsync.
+  const list = $("host-list");
+  if (list) {
+    list.innerHTML = "";
+    HOSTS.forEach(h => {
+      const li = document.createElement("li");
+      li.textContent = h;
+      if (h === state.selectedHost) li.classList.add("selected");
+      list.appendChild(li);
+    });
+  }
+  $("selected-host").textContent = state.selectedHost || "(unknown)";
+  $("sync-run-btn").disabled = true;   // already in flight; can't re-run
   setStatus("sync-status",
     "Welcome back — megammrsync is still pending approval (banner above shows steps).", "warn");
   awaitPendingThen(() => {
