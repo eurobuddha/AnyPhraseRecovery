@@ -14,19 +14,24 @@
     <p class="sub">Sweep funds out of a compromised webWallet seed without giving up control of this Minima node.</p>
   </header>
 
-  <!-- Sticky pending banner — fixed to top, always visible while a command is queued -->
+  <!-- Sticky pending banner — fixed to top, always visible while a command is queued.
+       Stays up until either (a) the UID disappears from the pending list, (b) the user
+       clicks "I approved it", or (c) the user dismisses (which rejects the awaiting cmd). -->
   <div id="pending-bar" class="pending-bar" hidden>
     <div class="pending-bar-inner">
       <div class="pending-bar-spinner">⏳</div>
       <div class="pending-bar-text">
-        <div class="pending-bar-title">Approve in MiniHub Pending</div>
+        <div class="pending-bar-title" id="pending-bar-title">Approve in MiniHub Pending</div>
         <div class="pending-bar-detail">
           <span id="pending-bar-cmd">command</span>
           <span class="pending-bar-uid" id="pending-bar-uid">—</span>
         </div>
         <div class="pending-bar-poll" id="pending-bar-poll">…polling for approval</div>
       </div>
-      <button id="pending-bar-dismiss" class="pending-bar-dismiss" title="Dismiss (you'll need to mark as approved manually)">×</button>
+      <div class="pending-bar-buttons">
+        <button id="pending-bar-confirm" class="pending-bar-confirm" title="If you've already approved in MiniHub, click here">I approved it</button>
+        <button id="pending-bar-dismiss" class="pending-bar-dismiss" title="Cancel — the dapp will treat the command as failed">×</button>
+      </div>
     </div>
   </div>
 
@@ -414,6 +419,10 @@
             <button id="mm-import-btn" class="btn primary" disabled>Import mega.mmr</button>
           </div>
           <p id="mm-import-status" class="status"></p>
+          <div id="mm-manual-path-row" hidden>
+            <p class="hint warn">Auto-resolution failed. Paste the absolute path to the downloaded <code>mega.mmr</code> file. Hint: it usually lands in the dapp's data folder under your Minima base directory; check the diagnostics console below for any clues.</p>
+            <input id="mm-manual-path" class="text-input mono" placeholder="/full/path/to/mega.mmr" spellcheck="false" autocomplete="off" />
+          </div>
         </div>
 
         <div class="megammr-step">

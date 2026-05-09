@@ -47,11 +47,14 @@ const state = {
   destinationMx: null,          // captured BEFORE any megammrsync
   hostFingerprint: null,        // sha256[:16] of sorted default-Mx list
 
-  // EPHEMERAL (per-session)
+  // PERSISTED — remembers when the post-sweep cooldown finishes so revisits skip the wait
+  restoreReadyAt: null,
+
+  // EPHEMERAL (per-session) — these are rebuilt on resume by the relevant enter*Step()
   compromisedSeed: null,        // only used to issue megammrsync, never persisted
   customDest: null,
   balances: [],
-  importedAddresses: [],
+  importedAddresses: [],        // rebuilt by loadSweepBalance() on resume
 };
 
 // ============================================================================
@@ -67,6 +70,7 @@ function savePersisted() {
       backupPassword: state.backupPassword,
       destinationMx: state.destinationMx,
       hostFingerprint: state.hostFingerprint,
+      restoreReadyAt: state.restoreReadyAt,
     }));
   } catch (_e) { /* localStorage may be unavailable; flow degrades but won't crash */ }
 }
@@ -88,6 +92,7 @@ function clearPersisted() {
   state.backupPassword = null;
   state.destinationMx = null;
   state.hostFingerprint = null;
+  state.restoreReadyAt = null;
 }
 
 function persistedAsString() {
@@ -175,73 +180,98 @@ function maskCommand(c) {
 }
 
 // ============================================================================
-// Sticky pending bar + auto-polling
+// Sticky pending bar + Universal-Casino-style pending registry
 //
-// Every cmd() that returns "pending" automatically:
-//   1. Shows the sticky pending bar at top of screen
-//   2. Polls `mds action:pending` every 2 sec until the UID disappears
-//   3. Hides the bar and returns a synthetic success response so the caller
-//      can continue as if the command had run synchronously.
+// Architecture:
+//   1. Every cmd() snapshots the pending list BEFORE issuing, so we can identify
+//      our own UID after the fact even when the response doesn't surface it.
+//   2. Pending detection is truthy on r.pending (not strict ===true), plus the
+//      error-string regex fallback.
+//   3. waitForPendingResolution shows the sticky banner and NEVER auto-hides on
+//      unknown UID — the user has a manual "I approved it" button always available.
+//   4. For megammrsync (long-running async), pending-removed is the APPROVAL signal,
+//      not the COMPLETION signal. We then wait MEGAMMRSYNC_RUN_SECONDS more before
+//      resolving, with the banner showing "running on node — DO NOT restart yet".
+//   5. Dismiss button rejects the awaiting Promise (PendingDismissedError) so the
+//      caller sees a clean failure instead of hanging forever.
 // ============================================================================
 
-let pendingPollTimer = null;
+const MEGAMMRSYNC_RUN_SECONDS = 90;          // post-approval wait before allowing restart
+const CMD_TIMEOUT_MS_DEFAULT = 60000;        // default per-cmd timeout
+const CMD_TIMEOUT_MS_LONG    = 300000;       // for backup / megammrsync (5 min)
 
-function showPendingBar(commandLabel, uid) {
-  $("pending-bar-cmd").textContent = commandLabel;
-  $("pending-bar-uid").textContent = "uid " + uid;
-  $("pending-bar-poll").textContent = "…polling for approval";
+class PendingDismissedError extends Error {
+  constructor() { super("Pending action dismissed by user"); this.name = "PendingDismissedError"; }
+}
+
+class CmdTimeoutError extends Error {
+  constructor(c, ms) { super("MDS timeout after " + ms + "ms running " + (c.split(" ")[0] || c)); this.name = "CmdTimeoutError"; }
+}
+
+// Single in-flight pending operation. Multiple parallel pendings are not currently
+// supported — the dapp's flow is strictly sequential, so this is fine.
+let pendingState = {
+  resolve: null,
+  reject: null,
+  uid: null,                // lowercase hex, or "(unknown)" if we can't identify it
+  command: null,            // full command string
+  label: null,              // short display label
+  startedAt: null,          // ms epoch when banner went up
+  approvedAt: null,         // ms epoch when UID disappeared from pending list (or manual)
+  timer: null,              // setInterval handle for polling
+  isLongRunning: false,     // true for megammrsync (post-approval wait required)
+};
+
+function resetPendingState() {
+  if (pendingState.timer) { clearInterval(pendingState.timer); pendingState.timer = null; }
+  pendingState.resolve = null;
+  pendingState.reject = null;
+  pendingState.uid = null;
+  pendingState.command = null;
+  pendingState.label = null;
+  pendingState.startedAt = null;
+  pendingState.approvedAt = null;
+  pendingState.isLongRunning = false;
+}
+
+function showPendingBar(label, uid, title) {
+  $("pending-bar-title").textContent = title || "Approve in MiniHub Pending";
+  $("pending-bar-cmd").textContent = label;
+  $("pending-bar-uid").textContent = "uid " + (uid === "(unknown)" ? "(unknown — use 'I approved it' button)" : uid);
+  $("pending-bar-poll").textContent = "…waiting";
   $("pending-bar").hidden = false;
 }
 
 function hidePendingBar() {
   $("pending-bar").hidden = true;
-  if (pendingPollTimer) { clearInterval(pendingPollTimer); pendingPollTimer = null; }
 }
 
-// Raw MDS.cmd that NEVER routes through our pending-handling cmd() wrapper.
-// Used only for the polling itself, which would otherwise infinite-loop.
-function rawCmd(c) {
-  return new Promise((resolve, reject) => {
-    MDS.cmd(c, res => res ? resolve(res) : reject(new Error("no response")));
-  });
+// Raw MDS.cmd with timeout. Bypasses the cmd() wrapper — used internally for polling.
+function rawCmd(c, timeoutMs) {
+  const t = timeoutMs || CMD_TIMEOUT_MS_DEFAULT;
+  return Promise.race([
+    new Promise(resolve => MDS.cmd(c, res => resolve(res))),
+    new Promise((_, reject) => setTimeout(() => reject(new CmdTimeoutError(c, t)), t)),
+  ]);
 }
 
 async function listPendingUids() {
   try {
-    const r = await rawCmd("mds action:pending");
-    const arr = (r.response || {}).pending || (r.response || []);
+    const r = await rawCmd("mds action:pending", 8000);
+    if (!r) return [];
+    const resp = r.response || {};
+    // MDS may return the pending list as response.pending OR as response itself
+    let arr = resp.pending || resp.list || (Array.isArray(resp) ? resp : null);
     if (!Array.isArray(arr)) return [];
-    return arr.map(p => (p && (p.uid || p.id || "")).toLowerCase()).filter(Boolean);
+    return arr
+      .map(p => p && String(p.uid || p.id || p || "").toLowerCase())
+      .filter(Boolean);
   } catch (_e) { return []; }
-}
-
-function waitForPendingResolution(commandLabel, uid) {
-  showPendingBar(commandLabel, uid);
-  diagLog("PENDING", { command: commandLabel, uid: uid });
-  return new Promise(resolve => {
-    if (pendingPollTimer) clearInterval(pendingPollTimer);
-    let pollCount = 0;
-    const targetUid = (uid || "").toLowerCase();
-    pendingPollTimer = setInterval(async () => {
-      pollCount++;
-      $("pending-bar-poll").textContent =
-        "…polling for approval (" + (pollCount * 2) + "s elapsed)";
-      const uids = await listPendingUids();
-      if (!targetUid || targetUid === "(unknown)" || !uids.includes(targetUid)) {
-        // UID resolved (approved or denied — either way it's no longer pending)
-        clearInterval(pendingPollTimer);
-        pendingPollTimer = null;
-        hidePendingBar();
-        diagLog("PENDING-RESOLVED", { uid: uid });
-        resolve({ status: true, response: { pendingResolved: true, uid: uid } });
-      }
-    }, 2000);
-  });
 }
 
 function isPendingResponse(r) {
   if (!r) return false;
-  if (r.pending === true) return true;
+  if (r.pending) return true;                    // truthy: covers true, "0xUID", obj
   const errMsg = r.error || "";
   if (errMsg && /pending|needs to be confirmed/i.test(errMsg)) return true;
   return false;
@@ -251,23 +281,143 @@ function extractPendingUid(r) {
   if (!r) return "(unknown)";
   if (r.uid) return String(r.uid).toLowerCase();
   if (typeof r.pending === "string") return r.pending.toLowerCase();
+  if (r.pending && r.pending.uid) return String(r.pending.uid).toLowerCase();
   const errMsg = r.error || "";
   const m = errMsg.match(/0x[A-Fa-f0-9]{20,}/);
   if (m) return m[0].toLowerCase();
-  // Last resort: take diff of pending list (we may have polled before issuing)
   return "(unknown)";
 }
 
-async function cmd(c) {
+function isLongRunningCommand(c) {
+  return /^megammrsync /.test(String(c).trim());
+}
+
+function waitForPendingResolution(commandStr, uid) {
+  const label = (commandStr.split(" ")[0] || commandStr).slice(0, 32);
+  const longRunning = isLongRunningCommand(commandStr);
+  showPendingBar(label, uid, "Approve in MiniHub Pending");
+  diagLog("PENDING", { command: label, uid: uid, longRunning: longRunning });
+
+  return new Promise((resolve, reject) => {
+    pendingState.resolve = resolve;
+    pendingState.reject  = reject;
+    pendingState.uid     = (uid || "").toLowerCase();
+    pendingState.command = commandStr;
+    pendingState.label   = label;
+    pendingState.startedAt = Date.now();
+    pendingState.isLongRunning = longRunning;
+
+    if (pendingState.timer) clearInterval(pendingState.timer);
+    pendingState.timer = setInterval(checkPendingResolution, 2000);
+    // Do an immediate first check so the user doesn't wait 2s for the first poll
+    checkPendingResolution();
+  });
+}
+
+async function checkPendingResolution() {
+  if (!pendingState.uid) return;        // already resolved
+  const elapsed = Math.floor((Date.now() - pendingState.startedAt) / 1000);
+
+  if (pendingState.approvedAt) {
+    // Long-running command — post-approval wait
+    const sincApproved = Math.floor((Date.now() - pendingState.approvedAt) / 1000);
+    const remaining = MEGAMMRSYNC_RUN_SECONDS - sincApproved;
+    if (remaining > 0) {
+      $("pending-bar-poll").textContent =
+        "approved — running on node, ~" + remaining + "s remaining (DO NOT restart yet)";
+    } else {
+      // post-approval wait complete — resolve as success
+      finalisePendingSuccess();
+    }
+    return;
+  }
+
+  $("pending-bar-poll").textContent =
+    pendingState.uid === "(unknown)"
+      ? "waiting for you to click 'I approved it' (UID couldn't be auto-detected)"
+      : "polling for approval (" + elapsed + "s elapsed)";
+
+  if (pendingState.uid === "(unknown)") return;  // can't auto-detect; wait for manual button
+
+  const uids = await listPendingUids();
+  if (!uids.includes(pendingState.uid)) {
+    // UID gone — approval (or denial) happened
+    onPendingApproved();
+  }
+}
+
+function onPendingApproved() {
+  pendingState.approvedAt = Date.now();
+  if (pendingState.isLongRunning) {
+    showPendingBar(
+      pendingState.label,
+      pendingState.uid,
+      "Approved — sync running on node (do NOT restart yet)"
+    );
+    // The poll timer keeps ticking; checkPendingResolution will finalise after the
+    // post-approval wait elapses.
+  } else {
+    finalisePendingSuccess();
+  }
+}
+
+function finalisePendingSuccess() {
+  if (!pendingState.resolve) return;
+  const resolve = pendingState.resolve;
+  diagLog("PENDING-RESOLVED", { uid: pendingState.uid, label: pendingState.label });
+  hidePendingBar();
+  resetPendingState();
+  resolve({ status: true, response: { pendingResolved: true } });
+}
+
+function onPendingManualApprove() {
+  // User clicked "I approved it" — treat as approved immediately
+  if (!pendingState.uid) return;
+  diagLog("PENDING-MANUAL-APPROVE", { uid: pendingState.uid, label: pendingState.label });
+  onPendingApproved();
+}
+
+function onPendingDismiss() {
+  if (!pendingState.reject) {
+    // No active pending — just hide the banner (defensive)
+    hidePendingBar();
+    return;
+  }
+  const reject = pendingState.reject;
+  diagLog("PENDING-DISMISSED", { uid: pendingState.uid, label: pendingState.label });
+  hidePendingBar();
+  resetPendingState();
+  reject(new PendingDismissedError());
+}
+
+async function cmd(c, opts) {
+  opts = opts || {};
+  const timeoutMs = opts.timeout
+    || (isLongRunningCommand(c) || /^backup /.test(c) ? CMD_TIMEOUT_MS_LONG : CMD_TIMEOUT_MS_DEFAULT);
+
   diagLog("CMD→", maskCommand(c));
-  const r = await new Promise(resolve => MDS.cmd(c, res => resolve(res)));
+  // Snapshot pending list BEFORE issuing — used to identify our UID afterwards
+  const beforeUids = await listPendingUids();
+
+  let r;
+  try {
+    r = await rawCmd(c, timeoutMs);
+  } catch (e) {
+    diagLog("ERR←", e.message);
+    throw e;
+  }
   diagLog("RES←", r);
 
   if (isPendingResponse(r)) {
-    const uid = extractPendingUid(r);
-    const label = (c.split(" ")[0] || c).slice(0, 32);
-    // Block until user approves in MiniHub
-    return await waitForPendingResolution(label, uid);
+    let uid = extractPendingUid(r);
+    if (uid === "(unknown)") {
+      // Try the diff of pending lists
+      const afterUids = await listPendingUids();
+      const newUids = afterUids.filter(u => !beforeUids.includes(u));
+      if (newUids.length === 1) uid = newUids[0];
+      else if (newUids.length > 1) uid = newUids[newUids.length - 1];
+    }
+    return await waitForPendingResolution(c, uid);
   }
 
   if (r && r.status) return r;
@@ -434,12 +584,7 @@ function onWelcomeStart() {
   enterSnapshotStep();
 }
 
-function onWelcomeClear() {
-  clearPersisted();
-  flashStatus("welcome-start-btn", "");
-  show("welcome");
-  alert("Saved state cleared. You can now start a fresh recovery.");
-}
+// (onWelcomeClear is defined further down — uses flashStatus instead of blocking alert)
 
 // ============================================================================
 // Step 1 — snapshot
@@ -520,6 +665,8 @@ async function onSnapBackup() {
   $("snap-backup-info").hidden = false;
   $("snap-backup-file").textContent = file + "  (full path will appear after backup completes)";
   $("snap-backup-password").textContent = pw;
+  // Persist immediately so a dapp close mid-backup still leaves recoverable state
+  savePersisted();
 
   $("snap-backup-log").textContent = "";
   $("snap-backup-log").hidden = false;
@@ -536,13 +683,27 @@ async function onSnapBackup() {
     const absolutePath = (((r.response || {}).backup) || {}).file || file;
     state.backupFile = absolutePath;
     $("snap-backup-file").textContent = absolutePath;
+    // CRITICAL: persist NOW so the user can close+reopen the dapp without losing the
+    // backup credentials they just wrote down.
+    savePersisted();
     setStatus("snap-backup-status", "Backup complete. Write the password down before continuing.", "ok");
     updateSnapshotEnabled();
   } catch (e) {
     stopLiveTerminal();
     appendLog("snap-backup-log", "ERROR: " + e.message);
-    setStatus("snap-backup-status", "Backup failed: " + e.message, "err");
+    // Reset state — don't leave stale credentials shown after a failure
+    state.backupFile = null;
+    state.backupPassword = null;
+    $("snap-backup-info").hidden = true;
+    savePersisted();
+    if (e.name === "PendingDismissedError") {
+      setStatus("snap-backup-status",
+        "Backup was dismissed. The action is no longer queued. Click Run backup to try again.", "warn");
+    } else {
+      setStatus("snap-backup-status", "Backup failed: " + e.message + ". Click Run backup to try again.", "err");
+    }
     $("snap-backup-btn").disabled = false;
+    updateSnapshotEnabled();
   }
 }
 
@@ -726,11 +887,14 @@ async function loadSweepBalance() {
 }
 
 function bindSweepConfirmListeners() {
-  // remove old listeners by replacing nodes (cheap idempotent rebind)
+  // remove old listeners by replacing nodes (cheap idempotent rebind).
+  // Also explicitly RESET the checked state — cloneNode preserves it, which would
+  // otherwise let a previous run's checked boxes carry forward without fresh consent.
   ["confirm-verified", "confirm-final", "confirm-custom-dest"].forEach(id => {
     const old = $(id);
     if (!old) return;
     const fresh = old.cloneNode(true);
+    fresh.checked = false;
     old.parentNode.replaceChild(fresh, old);
     fresh.addEventListener("change", updateSweepEnabled);
   });
@@ -843,14 +1007,26 @@ function enterRestoreStep() {
   $("restore-log").textContent = "";
   setStatus("restore-status", "");
 
-  // Wait period: give the chain time to mine the swept transactions before we
-  // pull the megammr — otherwise the new coins might not be indexed yet.
-  let remaining = POST_SWEEP_WAIT_SECONDS;
+  // Skip the wait if we're past the calculated ready-time (e.g. user revisited
+  // the step after waiting once already, or resumed from persisted state).
+  const readyAt = state.restoreReadyAt || (Date.now() + POST_SWEEP_WAIT_SECONDS * 1000);
+  if (!state.restoreReadyAt) {
+    state.restoreReadyAt = readyAt;
+    savePersisted();
+  }
+  let remaining = Math.max(0, Math.ceil((readyAt - Date.now()) / 1000));
+
+  if (remaining <= 0) {
+    setStatus("restore-wait-status", "Ready to restore.", "ok");
+    $("restore-run-btn").disabled = false;
+    return;
+  }
+
   setStatus("restore-wait-status",
     "Giving the chain " + remaining + "s to mine your sweep before restoring…", "warn");
   if (restoreCountdownTimer) clearInterval(restoreCountdownTimer);
   restoreCountdownTimer = setInterval(() => {
-    remaining -= 1;
+    remaining = Math.max(0, Math.ceil((readyAt - Date.now()) / 1000));
     if (remaining <= 0) {
       clearInterval(restoreCountdownTimer);
       restoreCountdownTimer = null;
@@ -997,6 +1173,12 @@ function onFinishRestart() {
   }
 }
 
+function onWelcomeClear() {
+  clearPersisted();
+  flashStatus("welcome-perm-warn", "Saved state cleared. Click Get started to begin a fresh recovery.", "ok");
+  show("welcome");
+}
+
 // ============================================================================
 // MEGAMMR HOST TAB
 // ============================================================================
@@ -1022,12 +1204,19 @@ async function mmDownload() {
   setStatus("mm-download-status", "Downloading " + MEGAMMR_FILE_URL + " — large file, please wait…");
   $("mm-download-btn").disabled = true;
   try {
-    await new Promise((resolve, reject) => {
+    diagLog("FILE.download→", { url: MEGAMMR_FILE_URL });
+    const res = await new Promise((resolve, reject) => {
       MDS.file.download(MEGAMMR_FILE_URL, function (res) {
+        diagLog("FILE.download←", res);
         if (res && res.status) resolve(res);
         else reject(new Error((res && res.error) || "download failed"));
       });
     });
+    // Capture any path the download response gave us — saves a getpath call
+    const r = res.response || {};
+    if (r.file || r.path || r.fullpath) {
+      state.megammrDownloadPath = r.file || r.path || r.fullpath;
+    }
     setStatus("mm-download-status", "Download complete. Saved to dapp folder.", "ok");
     $("mm-import-btn").disabled = false;
   } catch (e) {
@@ -1036,27 +1225,74 @@ async function mmDownload() {
   }
 }
 
-async function mmImport() {
-  setStatus("mm-import-status", "Importing — can take a few minutes for a large MMR file…");
-  $("mm-import-btn").disabled = true;
+// Three-layer defence to find the absolute path of the downloaded mega.mmr:
+//   1. The path returned by the download response (captured above)
+//   2. MDS.file.getpath
+//   3. MDS.file.list — enumerate the dapp folder, find by name
+async function resolveMmrPath() {
+  // Layer 1
+  if (state.megammrDownloadPath) {
+    diagLog("FILE.resolve(layer1)", state.megammrDownloadPath);
+    return state.megammrDownloadPath;
+  }
+  // Layer 2
   try {
-    const fullPath = await new Promise((resolve, reject) => {
+    const path = await new Promise((resolve, reject) => {
+      diagLog("FILE.getpath→", { name: MEGAMMR_LOCAL_FILENAME });
       MDS.file.getpath(MEGAMMR_LOCAL_FILENAME, function (res) {
+        diagLog("FILE.getpath←", res);
         if (res && res.status) {
           const r = res.response || {};
-          const path = r.path || r.fullpath || r.absolute ||
+          const p = r.path || r.fullpath || r.absolute ||
             (typeof res.response === "string" ? res.response : null);
-          if (path) return resolve(path);
+          if (p) return resolve(p);
         }
-        reject(new Error("could not resolve absolute path for " + MEGAMMR_LOCAL_FILENAME));
+        reject(new Error("getpath returned no usable path"));
       });
     });
+    diagLog("FILE.resolve(layer2)", path);
+    return path;
+  } catch (_e) { /* fall through to layer 3 */ }
+  // Layer 3
+  try {
+    const list = await new Promise((resolve, reject) => {
+      diagLog("FILE.list→", { dir: "/" });
+      MDS.file.list("/", function (res) {
+        diagLog("FILE.list←", res);
+        if (res && res.status) resolve(res.response || []);
+        else reject(new Error("list failed"));
+      });
+    });
+    const arr = Array.isArray(list) ? list : (list.files || list.list || []);
+    const match = arr.find(f => {
+      const n = (f && (f.name || f.filename || (typeof f === "string" ? f : ""))) || "";
+      return n === MEGAMMR_LOCAL_FILENAME || n.endsWith("/" + MEGAMMR_LOCAL_FILENAME);
+    });
+    if (match) {
+      const path = match.path || match.fullpath || match.name || match;
+      diagLog("FILE.resolve(layer3)", path);
+      return path;
+    }
+  } catch (_e) { /* fall through */ }
+  throw new Error("could not resolve path for " + MEGAMMR_LOCAL_FILENAME +
+    " — see diagnostic console (above) for raw responses, or paste the absolute path manually below");
+}
+
+async function mmImport() {
+  setStatus("mm-import-status", "Resolving file path…");
+  $("mm-import-btn").disabled = true;
+  try {
+    let fullPath = ($("mm-manual-path") && $("mm-manual-path").value || "").trim();
+    if (!fullPath) fullPath = await resolveMmrPath();
+    setStatus("mm-import-status", "Importing from " + fullPath + " — can take a few minutes…");
     await cmd("megammr action:import file:" + fullPath);
     setStatus("mm-import-status",
       "Import complete. This node is now running a MegaMMR — once it finishes catching up, others can sync from it.",
       "ok");
   } catch (e) {
     setStatus("mm-import-status", "Import failed: " + e.message, "err");
+    // Surface the manual-path input so the user can recover from a path-resolution failure
+    if ($("mm-manual-path-row")) $("mm-manual-path-row").hidden = false;
     $("mm-import-btn").disabled = false;
   }
 }
@@ -1130,8 +1366,10 @@ function wireUp() {
   // Step 5
   $("restore-run-btn").addEventListener("click", onRestoreRun);
 
-  // Sticky pending bar dismiss + diag console
-  $("pending-bar-dismiss").addEventListener("click", hidePendingBar);
+  // Sticky pending bar — dismiss rejects the awaiting Promise (so caller can
+  // surface a clean error); confirm fast-paths the resolution.
+  $("pending-bar-dismiss").addEventListener("click", onPendingDismiss);
+  $("pending-bar-confirm").addEventListener("click", onPendingManualApprove);
   $("diag-clear-btn").addEventListener("click", () => { $("diag-log").textContent = ""; });
   $("diag-copy-btn").addEventListener("click", () =>
     copyText($("diag-log").textContent).then(ok =>
@@ -1157,6 +1395,7 @@ function resumeFromPersisted() {
     return;
   }
   Object.assign(state, p);
+  diagLog("RESUME", { stage: p.stage });
   switch (p.stage) {
     case "import_sync_pending":
       // node has been rebooted (else MDS wouldn't be inited). Resume to sweep.
@@ -1165,9 +1404,12 @@ function resumeFromPersisted() {
     case "swept":
       // user closed dapp before triggering restore; resume to restore step
       show("restore");
+      setStatus("restore-status", "Welcome back — your sweep is recorded. Restore is the next step.", "ok");
       enterRestoreStep();
       break;
     case "restore_sync_pending":
+      show("verify");
+      setStatus("verify-status", "Welcome back — verifying the restore…", "ok");
       enterVerifyStep();
       break;
     case "verified":
@@ -1180,7 +1422,14 @@ function resumeFromPersisted() {
   }
 }
 
-document.addEventListener("DOMContentLoaded", function () {
+// DOMContentLoaded promise — used by MDS.init to ensure event listeners are wired
+// before any UI flow tries to render or respond to clicks.
+const domReady = new Promise(resolve => {
+  if (document.readyState !== "loading") resolve();
+  else document.addEventListener("DOMContentLoaded", resolve);
+});
+
+domReady.then(() => {
   wireUp();
   detectPlatform();
 });
@@ -1214,13 +1463,21 @@ async function showWelcomePermissionWarning() {
   }
 }
 
-MDS.init(function (msg) {
+MDS.init(async function (msg) {
+  // Make sure wireUp() has run before any handler tries to address DOM elements
+  await domReady;
   if (msg.event === "inited") {
-    detectPlatform();
     showTab("recover");
     showWelcomePermissionWarning();
     resumeFromPersisted();
   } else if (msg.event === "MINIMALOG") {
     onMinimaLog(msg.data);
+  } else if (msg.event === "NEWBLOCK" || msg.event === "NEWBALANCE") {
+    // Universal-Casino-style: a new block / balance change can be the signal that
+    // a long-running pending command (like a send) has been confirmed. If we're
+    // currently waiting on a pending send, treat this as a hint to re-poll.
+    if (pendingState.uid && pendingState.uid !== "(unknown)" && !pendingState.isLongRunning) {
+      checkPendingResolution();
+    }
   }
 });
