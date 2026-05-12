@@ -15,7 +15,7 @@
       <button id="global-reset-btn" class="btn header-reset" hidden
               title="Wipes saved recovery state and returns to the welcome screen">Start over</button>
     </div>
-    <p class="sub">Sweep funds out of a compromised webWallet seed without giving up control of this Minima node.</p>
+    <p class="sub">Sweep funds out of a webwallet seed without giving up control of this Minima node.</p>
   </header>
 
   <!-- Sticky pending banner — fixed to top of viewport, always visible while a command
@@ -67,12 +67,12 @@
           <h2>What this dapp does</h2>
           <ol class="explainer-numbered">
             <li><strong>Snapshot</strong> this Minima node (full backup, encrypted with a random password).</li>
-            <li><strong>Borrow</strong> the compromised seed: import it into this node via a public MegaMMR sync.</li>
+            <li><strong>Borrow</strong> the webwallet seed: import it into this node via a public MegaMMR sync.</li>
             <li><strong>Sweep</strong> all recovered balances back to <em>this node's own existing address</em>.</li>
             <li><strong>Restore</strong> this node from the snapshot — your original seed and wallet are back exactly as they were.</li>
           </ol>
           <div class="banner ok">
-            <strong>Net effect:</strong> the recovered funds end up in this node's normal wallet. The compromised seed never leaves this device. This node's identity is borrowed for ~5 minutes and then put back.
+            <strong>Net effect:</strong> the recovered funds end up in this node's normal wallet. The webwallet seed never leaves this device. This node's identity is borrowed for ~5 minutes and then put back.
           </div>
           <div class="banner warn">
             <strong>Two restarts required.</strong> The flow needs you to restart Minima twice (once after import, once after restore). The dapp remembers where you were and picks up automatically when you come back.
@@ -154,18 +154,18 @@
         </div>
       </div>
 
-      <!-- ===== Step 2 — paste compromised seed ===== -->
+      <!-- ===== Step 2 — paste webwallet seed ===== -->
       <div id="step-seed" class="step">
         <div class="card">
-          <div class="step-indicator">Step 2 of 5 — Paste the compromised seed</div>
-          <h2>Compromised webWallet seed</h2>
+          <div class="step-indicator">Step 2 of 5 — Paste the webwallet seed</div>
+          <h2>Target webwallet seed</h2>
           <div class="banner warn">
-            <strong>This seed is being treated as compromised.</strong>
+            <strong>This seed is being treated as the target.</strong>
             The recovery sweep will move every coin off it. After today, never type this seed into anything ever again.
           </div>
-          <p class="hint">Whatever you originally typed into the web wallet — exactly as you typed it. Webwallet seeds can be 24 BIP-39 words, or any custom string (e.g. a passphrase you made up). Case and spaces matter.</p>
+          <p class="hint">Whatever you originally typed into the webwallet — exactly as you typed it. Webwallet seeds can be 24 BIP-39 words, or any custom string (e.g. a passphrase you made up). Case and spaces matter.</p>
           <textarea id="seed-input"
-                    placeholder="enter your webWallet seed exactly as you typed it"
+                    placeholder="enter your webwallet seed exactly as you typed it"
                     spellcheck="false"
                     autocomplete="off"
                     autocapitalize="none"
@@ -181,7 +181,7 @@
       <!-- ===== Step 3 — pick host + run megammrsync ===== -->
       <div id="step-sync" class="step">
         <div class="card">
-          <div class="step-indicator">Step 3 of 5 — Sync the compromised wallet onto this node</div>
+          <div class="step-indicator">Step 3 of 5 — Sync the webwallet onto this node</div>
           <h2>MegaMMR host</h2>
           <p class="hint">A MegaMMR host has the recent chain state. The dapp picks one at random:</p>
           <ul id="host-list" class="host-list"></ul>
@@ -213,7 +213,7 @@
         <div class="card reboot-card">
           <div class="step-indicator">Restart required</div>
           <h2>Restart your Minima node now</h2>
-          <p>The compromised wallet has been imported onto this node. The Minima node needs a restart before we can read its balance.</p>
+          <p>The webwallet has been imported onto this node. The Minima node needs a restart before we can read its balance.</p>
 
           <div class="reboot-instructions reboot-android" hidden>
             <ol>
@@ -271,7 +271,7 @@
 
           <div id="sweep-dest-warn" class="banner danger" hidden>
             <strong>Destination overlap detected.</strong>
-            The destination matches an address from the imported (compromised) seed. That should not happen with the default flow — please report.
+            The destination matches an address from the imported (target) seed. That should not happen with the default flow — please report.
           </div>
 
           <div id="sweep-confirm-block" hidden>
@@ -410,25 +410,12 @@
         </div>
 
         <div class="megammr-step">
-          <div class="step-indicator">Step 2 — Download the MegaMMR seed file</div>
-          <p>This pulls <code>https://eurobuddha.com/mega.mmr</code> down to this node. May be large — give it a minute.</p>
+          <div class="step-indicator">Step 2 — Download and import <code>mega.mmr</code></div>
+          <p>Click below. Your Minima node will fetch <a href="https://eurobuddha.com/mega.mmr" target="_blank" rel="noopener">https://eurobuddha.com/mega.mmr</a> directly into its own storage and then import it. May take several minutes — large file.</p>
           <div class="actions row">
-            <button id="mm-download-btn" class="btn primary" disabled>Download mega.mmr</button>
-          </div>
-          <p id="mm-download-status" class="status"></p>
-        </div>
-
-        <div class="megammr-step">
-          <div class="step-indicator">Step 3 — Import it</div>
-          <p>Loads the file into your local MegaMMR.</p>
-          <div class="actions row">
-            <button id="mm-import-btn" class="btn primary" disabled>Import mega.mmr</button>
+            <button id="mm-import-btn" class="btn primary">Download and import mega.mmr</button>
           </div>
           <p id="mm-import-status" class="status"></p>
-          <div id="mm-manual-path-row" hidden>
-            <p class="hint warn">Auto-resolution failed. Paste the absolute path to the downloaded <code>mega.mmr</code> file. Hint: it usually lands in the dapp's data folder under your Minima base directory; check the diagnostics console below for any clues.</p>
-            <input id="mm-manual-path" class="text-input mono" placeholder="/full/path/to/mega.mmr" spellcheck="false" autocomplete="off" />
-          </div>
         </div>
 
         <div class="megammr-step">

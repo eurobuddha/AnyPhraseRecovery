@@ -1,10 +1,10 @@
-// AnyPhraseRecovery v0.4.12 — sweep funds out of a compromised webWallet seed and restore
+// AnyPhraseRecovery v0.4.19 — sweep funds out of a webwallet seed and restore
 // the host node back to its original state.
 //
 // The flow REQUIRES two node restarts (after each megammrsync). State is persisted to
 // localStorage so the dapp can resume exactly where it left off after each restart.
 //
-// The compromised seed never leaves this device. The only data sent off-device is the
+// The webwallet seed never leaves this device. The only data sent off-device is the
 // megammrsync RPC traffic to one of four known megammr hosts (or a custom one chosen
 // by the user under Advanced).
 
@@ -21,8 +21,6 @@ const HOSTS = [
 const KEYUSES = 2500;                                   // user-specified (matches original plan)
 const STORAGE_KEY = "anyphrase.flow.v1";
 const POST_SWEEP_WAIT_SECONDS = 60;                     // wait for send tx to be mined before restoring
-const MEGAMMR_FILE_URL = "https://eurobuddha.com/mega.mmr";
-const MEGAMMR_LOCAL_FILENAME = "mega.mmr";
 
 // ============================================================================
 // State
@@ -82,10 +80,9 @@ const state = {
   customDest: null,
 
   // EPHEMERAL (per-session) — these are rebuilt on resume by the relevant enter*Step()
-  compromisedSeed: null,        // only used to issue megammrsync, never persisted
+  targetSeed: null,        // only used to issue megammrsync, never persisted
   balances: [],
   importedAddresses: [],        // rebuilt by loadSweepBalance() on resume
-  megammrDownloadPath: null,    // captured from MDS.file.download response (megammr tab)
 };
 
 // ============================================================================
@@ -146,7 +143,6 @@ function clearPersisted() {
   state.inflightCommandLabel = null;
   state.sweepProgress = null;
   state.customDest = null;
-  state.megammrDownloadPath = null;
 }
 
 // Persisted pending bookkeeping — set immediately when entering pending so a dapp
@@ -167,7 +163,7 @@ function markPendingApprovedPersisted() {
 // when the caller is about to write some other state (e.g. a stage advance) and
 // wants the pending-clear and the stage update to land in localStorage as a
 // single atomic write — closes the window where a dapp kill between two
-// separate writes could leave the node holding the compromised seed but the
+// separate writes could leave the node holding the webwallet seed but the
 // dapp at "welcome".
 function clearPendingPersistedFields() {
   state.pendingUid = null;
@@ -510,7 +506,7 @@ async function checkPendingResolution() {
     const remaining = MEGAMMRSYNC_RUN_SECONDS - sincApproved;
     if (remaining > 0) {
       $("pending-bar-poll").textContent =
-        "approved — running on node, ~" + remaining + "s remaining (DO NOT restart yet)";
+        "approved — ~" + remaining + "s left. Node shuts down after; relaunch & reopen this dapp.";
     } else {
       finalisePendingSuccess();
     }
@@ -888,6 +884,13 @@ function detectPlatform() {
   const isAndroid = /Android/i.test(navigator.userAgent);
   document.querySelectorAll(".reboot-android").forEach(el => el.hidden = !isAndroid);
   document.querySelectorAll(".reboot-desktop").forEach(el => el.hidden = isAndroid);
+  // MegaMMR hosting requires desktop/server filesystem access — hide the tab on Android.
+  if (isAndroid) {
+    const mmTab = document.querySelector('[data-tab="megammr"]');
+    const mmPanel = document.getElementById("tab-megammr");
+    if (mmTab) mmTab.hidden = true;
+    if (mmPanel) mmPanel.hidden = true;
+  }
 }
 
 // ============================================================================
@@ -901,7 +904,7 @@ function onWelcomeStart() {
   hidePendingBar();
   resetPendingState();
   clearPersisted();
-  state.compromisedSeed = null;
+  state.targetSeed = null;
   state.customDest = null;
   enterSnapshotStep();
 }
@@ -1032,7 +1035,7 @@ async function onSnapBackup() {
 }
 
 // ============================================================================
-// Step 2 — paste compromised seed
+// Step 2 — paste webwallet seed
 // ============================================================================
 
 function onSeedContinue() {
@@ -1042,7 +1045,7 @@ function onSeedContinue() {
     return;
   }
   // Store VERBATIM — webwallet derived keys from the literal string, no normalization
-  state.compromisedSeed = raw;
+  state.targetSeed = raw;
   setStatus("seed-status", "");
   setupHostStep();
   show("sync");
@@ -1094,8 +1097,9 @@ function onCustomHostSet() {
 async function onRunSync() {
   $("sync-run-btn").disabled = true;
   setStatus("sync-status",
-    "Running megammrsync against " + state.selectedHost + " — this can take 1–2 minutes…");
-  startLiveTerminal("sync-log", "megammrsync action:resync (importing compromised seed)");
+    "Running megammrsync against " + state.selectedHost + " — 1–2 minutes. " +
+    "Node shuts down when done; relaunch Minima and reopen this dapp.");
+  startLiveTerminal("sync-log", "megammrsync action:resync (importing webwallet seed)");
   try {
     // NOTE: stage is NOT advanced before await. If we did and the user closed
     // the dapp during the pending wait (or the sync failed), we'd resume to the
@@ -1103,7 +1107,7 @@ async function onRunSync() {
     // balance as recoverable. The pending-uid persistence inside cmd() handles
     // recovery; the stage only advances once the megammrsync truly returns.
 
-    const phrase = state.compromisedSeed.replace(/"/g, '\\"');
+    const phrase = state.targetSeed.replace(/"/g, '\\"');
     const c = "megammrsync action:resync host:" + state.selectedHost +
               ' phrase:"' + phrase + '"' +
               " anyphrase:true keyuses:" + KEYUSES;
@@ -1116,7 +1120,7 @@ async function onRunSync() {
     // resolved via the deferred-clear pending path, clear those fields as part
     // of the same write so a kill between two saves can't drop the stage.
     state.stage = "import_sync_done";
-    state.compromisedSeed = null;
+    state.targetSeed = null;
     if (r && r._pendingDeferredClear) clearPendingPersistedFields();
     savePersisted();
 
@@ -1419,7 +1423,7 @@ async function onSweep() {
 
 function onSweepNext() {
   // If any token failed to send, warn before proceeding — funds remain at the
-  // compromised wallet for any failed token and won't be recovered. Read from
+  // webwallet for any failed token and won't be recovered. Read from
   // sweepProgress (source of truth), not the DOM — a render path that omits
   // the .err class would otherwise silently bypass the warning.
   const unfinished = (state.sweepProgress || []).filter(
@@ -1428,7 +1432,7 @@ function onSweepNext() {
   if (unfinished.length > 0) {
     if (!confirm(
       unfinished.length + " token(s) did not complete a successful send and remain at the " +
-      "compromised address. Continuing to restore now will leave them stranded. Continue anyway?"
+      "webwallet address. Continuing to restore now will leave them stranded. Continue anyway?"
     )) return;
   }
   show("restore");
@@ -1639,115 +1643,72 @@ async function mmDetect() {
   try {
     await cmd("megammr action:info");
     setStatus("mm-detect-status", "MegaMMR mode is active on this node.", "ok");
-    $("mm-download-btn").disabled = false;
   } catch (_e) {
     setStatus("mm-detect-status",
       "MegaMMR mode is NOT active. Restart your Minima node with -megammr in the startup arguments, then click Detect again.",
       "err");
-    $("mm-download-btn").disabled = true;
   } finally {
     $("mm-detect-btn").disabled = false;
   }
 }
 
-async function mmDownload() {
-  setStatus("mm-download-status", "Downloading " + MEGAMMR_FILE_URL + " — large file, please wait…");
-  $("mm-download-btn").disabled = true;
-  try {
-    diagLog("FILE.download→", { url: MEGAMMR_FILE_URL });
-    // Race the download against a 5-minute timeout — without it, an unreachable
-    // URL or a stalled download where the callback never fires hangs the dapp.
-    const res = await Promise.race([
-      new Promise((resolve, reject) => {
-        MDS.file.download(MEGAMMR_FILE_URL, function (res) {
-          diagLog("FILE.download←", res);
-          if (res && res.status) resolve(res);
-          else reject(new Error((res && res.error) || "download failed"));
-        });
-      }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("download timeout (5 minutes)")), 300000)),
-    ]);
-    // Capture any path the download response gave us — saves a getpath call
-    const r = res.response || {};
-    if (r.file || r.path || r.fullpath) {
-      state.megammrDownloadPath = r.file || r.path || r.fullpath;
-    }
-    setStatus("mm-download-status", "Download complete. Saved to dapp folder.", "ok");
-    $("mm-import-btn").disabled = false;
-  } catch (e) {
-    setStatus("mm-download-status", "Download failed: " + e.message, "err");
-    $("mm-download-btn").disabled = false;
-  }
-}
+// MDS.file.download fetches a URL via the Minima node itself and saves the
+// file to `<minima-base-folder>/Downloads/<filename>` (per mds.js docs:
+// "Will be put in Downloads folder"). Minima then resolves a relative
+// `file:Downloads/mega.mmr` against the same base folder for the import.
+// No file picker, no dapp-sandbox upload, no absolute-path resolution.
+const MEGAMMR_URL = "https://eurobuddha.com/mega.mmr";
 
-// Three-layer defence to find the absolute path of the downloaded mega.mmr:
-//   1. The path returned by the download response (captured above)
-//   2. MDS.file.getpath
-//   3. MDS.file.list — enumerate the dapp folder, find by name
-async function resolveMmrPath() {
-  // Layer 1
-  if (state.megammrDownloadPath) {
-    diagLog("FILE.resolve(layer1)", state.megammrDownloadPath);
-    return state.megammrDownloadPath;
-  }
-  // Layer 2
-  try {
-    const path = await new Promise((resolve, reject) => {
-      diagLog("FILE.getpath→", { name: MEGAMMR_LOCAL_FILENAME });
-      MDS.file.getpath(MEGAMMR_LOCAL_FILENAME, function (res) {
-        diagLog("FILE.getpath←", res);
-        if (res && res.status) {
-          const r = res.response || {};
-          const p = r.path || r.fullpath || r.absolute ||
-            (typeof res.response === "string" ? res.response : null);
-          if (p) return resolve(p);
-        }
-        reject(new Error("getpath returned no usable path"));
-      });
-    });
-    diagLog("FILE.resolve(layer2)", path);
-    return path;
-  } catch (_e) { /* fall through to layer 3 */ }
-  // Layer 3
-  try {
-    const list = await new Promise((resolve, reject) => {
-      diagLog("FILE.list→", { dir: "/" });
-      MDS.file.list("/", function (res) {
-        diagLog("FILE.list←", res);
-        if (res && res.status) resolve(res.response || []);
-        else reject(new Error("list failed"));
-      });
-    });
-    const arr = Array.isArray(list) ? list : (list.files || list.list || []);
-    const match = arr.find(f => {
-      const n = (f && (f.name || f.filename || (typeof f === "string" ? f : ""))) || "";
-      return n === MEGAMMR_LOCAL_FILENAME || n.endsWith("/" + MEGAMMR_LOCAL_FILENAME);
-    });
-    if (match) {
-      const path = match.path || match.fullpath || match.name || match;
-      diagLog("FILE.resolve(layer3)", path);
-      return path;
-    }
-  } catch (_e) { /* fall through */ }
-  throw new Error("could not resolve path for " + MEGAMMR_LOCAL_FILENAME +
-    " — see diagnostic console (above) for raw responses, or paste the absolute path manually below");
-}
-
-async function mmImport() {
-  setStatus("mm-import-status", "Resolving file path…");
+async function mmDownloadAndImport() {
   $("mm-import-btn").disabled = true;
   try {
-    let fullPath = ($("mm-manual-path") && $("mm-manual-path").value || "").trim();
-    if (!fullPath) fullPath = await resolveMmrPath();
-    setStatus("mm-import-status", "Importing from " + fullPath + " — can take a few minutes…");
-    await cmd("megammr action:import file:" + fullPath);
-    setStatus("mm-import-status",
-      "Import complete. This node is now running a MegaMMR — once it finishes catching up, others can sync from it.",
-      "ok");
+    setStatus("mm-import-status", "Downloading mega.mmr via your node — large file, please wait…");
+    const dlRes = await new Promise((resolve, reject) => {
+      diagLog("FILE.download→", { url: MEGAMMR_URL });
+      MDS.file.download(MEGAMMR_URL, function (res) {
+        diagLog("FILE.download←", res);
+        if (res && res.status) resolve(res);
+        else reject(new Error((res && res.error) || "download failed"));
+      });
+    });
+
+    // Most Minima node versions save downloads to <base>/Downloads/<filename>.
+    // Try that path first; if the node version stores it elsewhere, fall back
+    // to a couple of other common layouts.
+    const candidatePaths = [
+      "Downloads/mega.mmr",
+      "downloads/mega.mmr",
+      "mega.mmr",
+    ];
+    // If the download response itself revealed an absolute path, try that too.
+    const r = dlRes && dlRes.response;
+    [r && r.file, r && r.path, r && r.fullpath, r && r.absolute]
+      .filter(p => typeof p === "string" && p.length > 0)
+      .forEach(p => candidatePaths.unshift(p));
+    diagLog("IMPORT.candidates", candidatePaths);
+
+    let lastErr = null;
+    for (const path of candidatePaths) {
+      setStatus("mm-import-status", "Importing from " + path + " — can take a few minutes…");
+      try {
+        await cmd("megammr action:import file:" + path);
+        setStatus("mm-import-status",
+          "Import complete. Your Minima node has shut down — restart it now. Once it finishes catching up, others can sync from it.",
+          "ok");
+        return;
+      } catch (e) {
+        diagLog("IMPORT.attempt failed", { path, error: e.message });
+        lastErr = e;
+        // "file doesn't exist" is the only error we should keep trying past;
+        // anything else (auth, mode, etc.) won't be fixed by a different path.
+        if (!/doesn'?t exist|not found|no such/i.test(e.message)) break;
+      }
+    }
+    throw lastErr || new Error("all import paths failed");
   } catch (e) {
-    setStatus("mm-import-status", "Import failed: " + e.message, "err");
-    // Surface the manual-path input so the user can recover from a path-resolution failure
-    if ($("mm-manual-path-row")) $("mm-manual-path-row").hidden = false;
+    setStatus("mm-import-status",
+      "Failed: " + e.message + ". Check the diagnostics console (top of page) for the raw responses.",
+      "err");
     $("mm-import-btn").disabled = false;
   }
 }
@@ -1842,8 +1803,7 @@ function wireUp() {
 
   // MegaMMR tab
   $("mm-detect-btn").addEventListener("click", mmDetect);
-  $("mm-download-btn").addEventListener("click", mmDownload);
-  $("mm-import-btn").addEventListener("click", mmImport);
+  $("mm-import-btn").addEventListener("click", mmDownloadAndImport);
   $("mm-netinfo-btn").addEventListener("click", mmNetinfo);
   $("mm-netinfo-copy-btn").addEventListener("click", () =>
     copyText($("mm-netinfo").textContent).then(ok =>
@@ -2092,7 +2052,7 @@ function resumeSyncPending() {
   // sees activity (matches what onRunSync would show in a no-restart flow).
   const onApproved = () => {
     setStatus("sync-status",
-      "Approved — megammrsync is running on the node. Do NOT restart yet (banner above shows the countdown).",
+      "Approved — megammrsync running on node. When done, node shuts down; relaunch and reopen this dapp.",
       "ok");
     const log = $("sync-log");
     if (log) {
@@ -2117,7 +2077,7 @@ function resumeSyncPending() {
     // Long-running pending: finalisePendingSuccess deferred the clear so we
     // can land stage and pending-clear in a single localStorage write.
     state.stage = "import_sync_done";
-    state.compromisedSeed = null;
+    state.targetSeed = null;
     clearPendingPersistedFields();
     savePersisted();
     stopLiveTerminal("sync complete");
